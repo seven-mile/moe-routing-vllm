@@ -272,6 +272,7 @@ class RequestState:
     def make_request_output(
         self,
         new_token_ids: list[int],
+        new_token_top_ks: list[list[int]],
         pooling_output: torch.Tensor | None,
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
@@ -316,7 +317,9 @@ class RequestState:
                 finished,
             )
 
-        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)
+        output = self._new_completion_output(
+            new_token_ids, new_token_top_ks, finish_reason, stop_reason
+        )
 
         if self.parent_req is None:
             outputs = [output]
@@ -376,6 +379,7 @@ class RequestState:
     def _new_completion_output(
         self,
         token_ids: list[int],
+        token_top_ks: list[list[int]],
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
     ) -> CompletionOutput:
@@ -388,6 +392,7 @@ class RequestState:
         text = self.detokenizer.get_next_output_text(finished, delta)
         if not delta:
             token_ids = self.detokenizer.output_token_ids
+            token_top_ks = self.detokenizer.token_top_ks
 
         # Prepare logprobs, based on delta mode
         logprobs = self.logprobs_processor.logprobs
@@ -403,6 +408,7 @@ class RequestState:
             index=self.request_index,
             text=text,
             token_ids=token_ids,
+            token_top_ks=token_top_ks,
             routed_experts=routed_experts,
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
@@ -489,6 +495,7 @@ class OutputProcessor:
                 if req_state.queue is not None and (
                     request_output := req_state.make_request_output(
                         new_token_ids=[],
+                        new_token_top_ks=[],
                         # Set pooling_output is not None to
                         # correctly enter the abort pooling branch
                         pooling_output=EMPTY_CPU_TENSOR
@@ -616,6 +623,7 @@ class OutputProcessor:
             )
 
             new_token_ids = engine_core_output.new_token_ids
+            new_token_top_ks = engine_core_output.new_token_top_ks
             pooling_output = engine_core_output.pooling_output
             finish_reason = engine_core_output.finish_reason
             stop_reason = engine_core_output.stop_reason
@@ -637,7 +645,7 @@ class OutputProcessor:
                 assert req_state.logprobs_processor is not None
                 # 2) Detokenize the token ids into text and perform stop checks.
                 stop_string = req_state.detokenizer.update(
-                    new_token_ids, finish_reason == FinishReason.STOP
+                    new_token_ids, finish_reason == FinishReason.STOP, new_token_top_ks
                 )
                 if stop_string:
                     finish_reason = FinishReason.STOP
@@ -650,6 +658,7 @@ class OutputProcessor:
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(
                 new_token_ids,
+                new_token_top_ks,
                 pooling_output,
                 finish_reason,
                 stop_reason,

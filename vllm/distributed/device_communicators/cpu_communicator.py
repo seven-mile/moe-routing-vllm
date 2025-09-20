@@ -170,10 +170,10 @@ class CpuCommunicator(DeviceCommunicatorBase):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         is_sequence_parallel: bool = False,
-        extra_tensors: list[torch.Tensor] | None = None,
+        extra_tensors: dict[str, torch.Tensor] | None = None,
     ) -> (
         tuple[torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]
+        | tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]
     ):
         """
         Dispatch the hidden states and router logits to the appropriate device.
@@ -194,10 +194,10 @@ class CpuCommunicator(DeviceCommunicatorBase):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         is_sequence_parallel: bool = False,
-        extra_tensors: list[torch.Tensor] | None = None,
+        extra_tensors: dict[str, torch.Tensor] | None = None,
     ) -> (
         tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]
     ):
         """
         Dispatch the hidden states and topk weights/ids to the appropriate device.

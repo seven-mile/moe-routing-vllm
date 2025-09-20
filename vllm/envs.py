@@ -183,6 +183,8 @@ if TYPE_CHECKING:
     )
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
+    VLLM_DYN_TOPK_APPLY_LAST_TOKEN: bool = False
+    VLLM_DYN_TOPKS_NO_DROP_TOKENS: bool = False
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
     VLLM_ALLOW_INSECURE_SERIALIZATION: bool = False
@@ -1347,6 +1349,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_FLASHINFER_MOE_MXFP4_BF16": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_BF16", "0"))
     ),
+    # If set to 1, extraly apply dynamic top-k on the last token with mean k.
+    "VLLM_DYN_TOPK_APPLY_LAST_TOKEN":
+    lambda: bool(int(os.getenv("VLLM_DYN_TOPK_APPLY_LAST_TOKEN", "0"))),
+    # If set to 1, the tokens won't be dropped during comp & comm.
+    # We will just set their weights to 0.
+    # This enables precompiled installation and naive dispatch combine.
+    "VLLM_DYN_TOPKS_NO_DROP_TOKENS":
+    lambda: bool(int(os.getenv("VLLM_DYN_TOPKS_NO_DROP_TOKENS", "0"))),
     # Control the cache sized used by the xgrammar compiler. The default
     # of 512 MB should be enough for roughly 1000 JSON schemas.
     # It can be changed with this variable if needed for some reason.

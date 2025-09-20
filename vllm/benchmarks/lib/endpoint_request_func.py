@@ -86,6 +86,9 @@ class RequestFuncOutput:
     """The output of the request function including metrics."""
 
     generated_text: str = ""
+    generated_token_top_ks: list[list[int]] = field(
+        default_factory=list)
+    avg_token_top_k: float | None = None
     success: bool = False
     latency: float = 0.0
     output_tokens: int = 0
@@ -190,6 +193,7 @@ async def async_request_openai_completions(
     output.prompt_len = request_func_input.prompt_len
 
     generated_text = ""
+    generated_token_top_ks = []
     st = time.perf_counter()
     output.start_time = st
     most_recent_timestamp = st
@@ -224,6 +228,7 @@ async def async_request_openai_completions(
                                 # Note that text could be empty here
                                 # e.g. for special tokens
                                 text = choices[0].get("text")
+                                token_top_ks = choices[0].get("token_top_ks")
                                 timestamp = time.perf_counter()
                                 # First token
                                 if not first_chunk_received:
@@ -237,6 +242,7 @@ async def async_request_openai_completions(
 
                                 most_recent_timestamp = timestamp
                                 generated_text += text or ""
+                                generated_token_top_ks.extend(token_top_ks or [])
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
                                 if (pt := usage.get("prompt_tokens")) is not None:
@@ -250,6 +256,12 @@ async def async_request_openai_completions(
                         "This response will be marked as failed!"
                     )
                 output.generated_text = generated_text
+                output.generated_token_top_ks = generated_token_top_ks
+                if generated_token_top_ks:
+                    if total_token_topks := sum(len(ks) for ks in generated_token_top_ks):
+                        output.avg_token_top_k = sum(
+                            k for ks in generated_token_top_ks for k in ks
+                        ) / total_token_topks
                 output.latency = most_recent_timestamp - st
             else:
                 output.error = response.reason or ""

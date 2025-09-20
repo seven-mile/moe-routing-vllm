@@ -17,7 +17,7 @@ def _quantize_and_setup_dispatch(
     a1: torch.Tensor,
     quant_config: FusedMoEQuantConfig,
     defer_input_quant: bool = False,
-) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
     # Defer input quantization to the MoE kernel.
     if defer_input_quant:
         a1q = a1
@@ -47,17 +47,17 @@ def _quantize_and_setup_dispatch(
     # (the scale is a scalar, replicated on all ranks) or
     # if quantization is deferred.
     skip_gather_scales = a1q_scale is None or a1q_scale.ndim == 0
-    scales = None if skip_gather_scales else [a1q_scale]
+    scales = None if skip_gather_scales else {"a1q_scale": a1q_scale}
 
     return a1q, scales
 
 
 def _unwrap_scale_and_prepare_for_moe(
-    scales: list[torch.Tensor] | None,
+    scales: dict[str, torch.Tensor] | None,
     quant_config: FusedMoEQuantConfig,
 ) -> torch.Tensor:
-    assert scales is not None and len(scales) == 1
-    a1q_scale = scales[0]
+    assert scales is not None and "a1q_scale" in scales
+    a1q_scale = scales["a1q_scale"]
     # Apply swizzling after a2a if the MoE kernel needs it.
     if quant_config.quant_dtype == "nvfp4" and quant_config.is_scale_swizzled:
         assert a1q_scale is not None

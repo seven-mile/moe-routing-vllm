@@ -6,6 +6,7 @@ import gc
 import itertools
 import threading
 import time
+import warnings
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
@@ -174,6 +175,7 @@ from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
+from vllm.v1.spec_decode.llm_base_proposer import FusedTopKActionTensors
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
@@ -703,6 +705,7 @@ class GPUModelRunner(
 
         # Persistent buffers for CUDA graphs.
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
+        self._input_top_ks: CpuGpuBuffer | None = None
         self.positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=self.device
         )
@@ -835,6 +838,7 @@ class GPUModelRunner(
             self._num_valid_draft_tokens_event = torch.cuda.Event()
             self._num_valid_draft_tokens_copy_stream = torch.cuda.Stream()
 
+        self._draft_token_top_ks: torch.Tensor | None = None
         self._draft_token_req_ids: list[str] | None = None
         self.transfer_event = torch.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -865,6 +869,7 @@ class GPUModelRunner(
                 device="cpu",
                 pin_memory=self.pin_memory,
             )
+            self.draft_token_top_ks_cpu: torch.Tensor | None = None
             if self.use_async_scheduling:
                 self.valid_sampled_token_count_event = torch.Event()
                 self.valid_sampled_token_count_copy_stream = torch.cuda.Stream()
@@ -957,6 +962,11 @@ class GPUModelRunner(
                         param = getattr(module, attr)
                         if isinstance(param, torch.Tensor):
                             param.fill_(v_scale_val)
+
+    @property
+    def input_top_ks(self) -> CpuGpuBuffer:
+        assert self._input_top_ks is not None
+        return self._input_top_ks
 
     def _get_positions(self, num_tokens: Any):
         if isinstance(num_tokens, int):
@@ -1146,6 +1156,9 @@ class GPUModelRunner(
         # that they get cleared from the persistent batch before being re-scheduled
         # in the normal resumed request path.
         unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
+        scheduled_action_cfgs = (
+            scheduler_output.scheduled_req_dyn_assisted_action_configs
+        )
         # NOTE(woosuk): The persistent batch optimization assumes that
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
@@ -1169,6 +1182,9 @@ class GPUModelRunner(
             if req_id in self.requests:
                 # For streaming case only.
                 req_state = self._update_streaming_request(req_id, new_req_data)
+                req_state.dyn_assisted_action_config_str = scheduled_action_cfgs.get(
+                    req_id, "null"
+                )
                 reqs_to_add.append(req_state)
                 continue
 
@@ -1206,6 +1222,7 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                dyn_assisted_action_config_str=scheduled_action_cfgs.get(req_id, "null"),
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -1234,6 +1251,7 @@ class GPUModelRunner(
         is_last_rank = get_pp_group().is_last_rank
         req_data = scheduler_output.scheduled_cached_reqs
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        scheduled_spec_token_top_ks = scheduler_output.scheduled_spec_decode_token_top_ks
 
         # Save scheduler-allocated spec lengths before trimming so
         # prev_num_draft_len keeps the optimistic count for rejection correction.
@@ -1255,6 +1273,9 @@ class GPUModelRunner(
 
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
+            req_state.dyn_assisted_action_config_str = scheduled_action_cfgs.get(
+                req_id, "null"
+            )
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
@@ -1371,6 +1392,10 @@ class GPUModelRunner(
 
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
+            if self.input_batch._dyn_action is not None:
+                self.input_batch.update_dyn_assisted_action(
+                    req_index, req_state.dyn_assisted_action_config_str
+                )
             if new_block_ids is not None:
                 self.input_batch.block_table.append_row(new_block_ids, req_index)
 
@@ -1399,8 +1424,12 @@ class GPUModelRunner(
                     ] = True
                     self.input_batch.num_tokens_no_spec[req_index] = end_token_index
 
+                raise NotImplementedError("PP support NYI")
+
             # Add spec_token_ids to token_ids_cpu.
-            self.input_batch.update_req_spec_token_ids(req_state, scheduled_spec_tokens)
+            self.input_batch.update_req_spec_token_ids(
+                req_state, scheduled_spec_tokens, scheduled_spec_token_top_ks
+            )
             # Restore scheduler-side draft count after ngram trimming.
             if original_num_spec_per_req:
                 orig = original_num_spec_per_req.get(req_id, 0)
@@ -1411,7 +1440,9 @@ class GPUModelRunner(
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
             self.input_batch.add_request(request)
-            self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
+            self.input_batch.update_req_spec_token_ids(
+                request, scheduled_spec_tokens, scheduled_spec_token_top_ks
+            )
 
         # Condense the batched states if there are gaps left by removed requests
         self.input_batch.condense()
@@ -1419,6 +1450,7 @@ class GPUModelRunner(
         self._may_reorder_batch(scheduler_output)
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
+        self.input_batch.sync_dyn_assisted_action_to_gpu(self.input_batch.num_reqs)
 
         # Incrementally update ngram_gpu tensors after batch is stable
         if is_ngram_gpu:
@@ -1678,10 +1710,13 @@ class GPUModelRunner(
         if self.input_batch.prev_sampled_token_ids is None:
             # Normal scheduling case
             self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+            self.input_top_ks.copy_to_gpu(total_num_scheduled_tokens)
             if self.enable_prompt_embeds:
                 self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
                 self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
             return
+    
+        assert False, "Async scheduling top_ks NYI"
 
         # Async scheduling case, where some decode requests from the previous
         # iteration won't have entries in input_ids_cpu and need to be copied
@@ -1897,6 +1932,12 @@ class GPUModelRunner(
             0,
             token_indices_tensor,
             out=self.input_ids.cpu[:total_num_scheduled_tokens],
+        )
+        torch.index_select(
+            self.input_batch.token_top_ks_cpu_tensor.flatten(0, 1),
+            0,
+            token_indices_tensor,
+            out=self.input_top_ks.cpu[:total_num_scheduled_tokens]
         )
         if self.enable_prompt_embeds:
             is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
@@ -2732,15 +2773,20 @@ class GPUModelRunner(
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
         draft_token_ids = self.input_ids.gpu[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
+        draft_token_top_ks = self.input_top_ks.gpu[logits_indices]
+        draft_token_top_ks = draft_token_top_ks[target_logits_indices + 1]
 
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
+            draft_token_top_ks=draft_token_top_ks,
             num_draft_tokens=num_draft_tokens.tolist(),
             cu_num_draft_tokens=cu_num_draft_tokens,
             cu_num_sampled_tokens=cu_num_sampled_tokens,
             target_logits_indices=target_logits_indices,
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
+            num_moe_layers=self.model.num_moe_layers,
+            base_top_k=self.model_config.get_num_experts_per_token(),
         )
 
     def _prepare_kv_sharing_fast_prefill(
@@ -3320,6 +3366,7 @@ class GPUModelRunner(
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,
+        torch.Tensor | None,
         torch.Tensor,
         IntermediateTensors | None,
         dict[str, Any],
@@ -3355,10 +3402,12 @@ class GPUModelRunner(
             self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)
 
             input_ids, inputs_embeds = self._prepare_mm_inputs(num_input_tokens)
+            input_top_ks = None
             model_kwargs = {
                 **self._init_model_kwargs(),
                 **self._extract_mm_kwargs(scheduler_output),
             }
+            raise NotImplementedError("token_top_ks NYI")
         elif self.enable_prompt_embeds and is_first_rank:
             # Get the input embeddings for the tokens that are not input embeds,
             # then put them into the appropriate positions.
@@ -3386,12 +3435,15 @@ class GPUModelRunner(
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
             model_kwargs = self._init_model_kwargs()
             input_ids = None
+            input_top_ks = None
+            assert False, "token_top_ks NYI"
         else:
             # For text-only models, we use token ids as input.
             # While it is possible to use embeddings as input just like the
             # multimodal models, it is not desirable for performance since
             # then the embedding layer is not included in the CUDA graph.
             input_ids = self.input_ids.gpu[:num_input_tokens]
+            input_top_ks = self.input_top_ks.gpu[:num_input_tokens]
             inputs_embeds = None
             model_kwargs = self._init_model_kwargs()
 
@@ -3423,6 +3475,7 @@ class GPUModelRunner(
 
         return (
             input_ids,
+            input_top_ks,
             inputs_embeds,
             positions,
             intermediate_tensors,
@@ -3449,7 +3502,7 @@ class GPUModelRunner(
         # Update spec_token_ids with real draft tokens from pre step only when
         # output_token_ids is needed (penalties or bad_words are in use).
         if self.use_async_scheduling and self._draft_token_req_ids is not None:
-            draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
+            draft_token_ids_cpu, _, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
         draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
@@ -3472,6 +3525,7 @@ class GPUModelRunner(
         dict[str, int],
         LogprobsLists | None,
         list[list[int]],
+        list[list[list[int]]],
         dict[str, LogprobsTensors | None],
         list[str],
         dict[str, int],
@@ -3498,6 +3552,15 @@ class GPUModelRunner(
         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
         sampled_token_ids = sampler_output.sampled_token_ids
         logprobs_tensors = sampler_output.logprobs_tensors
+        sampled_token_top_ks = sampler_output.sampled_token_top_ks
+        next_draft_first_token_top_ks = (
+            self._draft_token_top_ks[:, 0:]
+            if self._draft_token_top_ks is not None
+            else torch.tensor([
+                [[8 for _ in range(self.model.num_moe_layers)]]
+                for _ in range(num_sampled_tokens)
+            ], device='cpu')
+        )
         invalid_req_indices = []
         logprobs_lists = None
         if not self.use_async_scheduling:
@@ -3527,16 +3590,23 @@ class GPUModelRunner(
 
                 if logprobs_tensors is not None:
                     logprobs_lists = logprobs_tensors.tolists()
+
+                valid_token_top_ks = next_draft_first_token_top_ks.tolist()
             else:
                 # Includes spec decode tokens.
-                valid_sampled_token_ids, logprobs_lists = RejectionSampler.parse_output(
+                # All input tokens for decode phase are to sample.
+                # So we just take all top-ks of the accepted tokens.
+                valid_sampled_token_ids, logprobs_lists, valid_token_top_ks = RejectionSampler.parse_output(
                     sampled_token_ids,
                     self.input_batch.vocab_size,
                     discard_sampled_tokens_req_indices,
                     logprobs_tensors=logprobs_tensors,
+                    sampled_token_top_ks=sampled_token_top_ks,
+                    next_draft_first_token_top_ks=next_draft_first_token_top_ks,
                 )
         else:
             valid_sampled_token_ids = []
+            valid_token_top_ks = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
             invalid_req_indices_set = set(invalid_req_indices)
 
@@ -3552,6 +3622,7 @@ class GPUModelRunner(
                 for i, req_id in enumerate(self.input_batch.req_ids)
                 if i not in invalid_req_indices_set
             }
+            assert False, "async scheduler compatibility NYI"
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
@@ -3596,6 +3667,7 @@ class GPUModelRunner(
             num_nans_in_logits,
             logprobs_lists,
             valid_sampled_token_ids,
+            valid_token_top_ks,
             prompt_logprobs_dict,
             req_ids_output_copy,
             req_id_to_index_output_copy,
@@ -4117,6 +4189,7 @@ class GPUModelRunner(
 
             (
                 input_ids,
+                input_top_ks,
                 inputs_embeds,
                 positions,
                 intermediate_tensors,
@@ -4146,6 +4219,9 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        assert input_top_ks is not None
+        assert input_top_ks.shape[:1] == input_ids.shape, (
+            f"token_top_ks_cpu shape {input_top_ks.shape} should match input_ids shape {input_ids.shape}")
         with (
             set_forward_context(
                 attn_metadata,
@@ -4155,6 +4231,7 @@ class GPUModelRunner(
                 cudagraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
+                token_top_ks=input_top_ks,
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
             ),
@@ -4315,6 +4392,7 @@ class GPUModelRunner(
         self._draft_token_ids = None
         self._draft_probs = None
         self._draft_prob_req_ids = None
+        self._draft_token_top_ks = None
         self._draft_token_req_ids = None
         self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
@@ -4322,7 +4400,7 @@ class GPUModelRunner(
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("gpu_model_runner: draft"):
-                self._draft_token_ids = self.propose_draft_token_ids(
+                self._draft_token_ids, self._draft_token_top_ks = self.propose_draft_token_ids(
                     scheduler_output,
                     sampled_token_ids,
                     self.input_batch.sampling_metadata,
@@ -4418,6 +4496,7 @@ class GPUModelRunner(
                 num_nans_in_logits,
                 logprobs_lists,
                 valid_sampled_token_ids,
+                valid_token_top_ks,
                 prompt_logprobs_dict,
                 req_ids_output_copy,
                 req_id_to_index_output_copy,
@@ -4453,6 +4532,7 @@ class GPUModelRunner(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
                 sampled_token_ids=valid_sampled_token_ids,
+                token_top_ks=valid_token_top_ks,
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 kv_connector_output=kv_connector_output,
@@ -4570,8 +4650,8 @@ class GPUModelRunner(
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:
             return None
-        draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
-        return DraftTokenIds(req_ids, draft_token_ids)
+        draft_token_ids, draft_token_top_ks, req_ids = self._get_draft_token_ids_cpu()
+        return DraftTokenIds(req_ids, draft_token_ids, draft_token_top_ks)
 
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
@@ -4589,6 +4669,9 @@ class GPUModelRunner(
         draft_token_ids: torch.Tensor = self._draft_token_ids
         if not torch.is_tensor(draft_token_ids):
             return
+        draft_token_top_ks: torch.Tensor = self._draft_token_top_ks
+        assert torch.is_tensor(draft_token_top_ks)
+
         assert self.draft_token_ids_event is not None
         assert self.draft_token_ids_copy_stream is not None
         assert self.draft_token_ids_cpu is not None
@@ -4601,21 +4684,29 @@ class GPUModelRunner(
                 self.draft_token_ids_cpu[:num_reqs].copy_(
                     draft_token_ids, non_blocking=True
                 )
+                self.draft_token_top_ks_cpu[:num_reqs].copy_(
+                    draft_token_top_ks, non_blocking=True
+                )
             else:
                 # No copy needed, just zero-out cpu tensor.
                 self.draft_token_ids_cpu[:num_reqs] = 0
+                self.draft_token_top_ks_cpu[:num_reqs] = 0
             self.draft_token_ids_event.record()
 
-    def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[str]]:
+    def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[list[list[int]]], list[str]]:
         if isinstance(self._draft_token_ids, list):
-            return self._draft_token_ids, self.input_batch.req_ids
+            return self._draft_token_ids, self._draft_token_top_ks, self.input_batch.req_ids
         req_ids = self._draft_token_req_ids
         if req_ids is None:
-            return [], []
+            return [], [], []
         assert self.draft_token_ids_event is not None
         assert self.draft_token_ids_cpu is not None
         self.draft_token_ids_event.synchronize()
-        return self.draft_token_ids_cpu[: len(req_ids)].tolist(), req_ids
+        return (
+            self.draft_token_ids_cpu[: len(req_ids)].tolist(),
+            self.draft_token_top_ks_cpu[: len(req_ids)].tolist(),
+            req_ids,
+        )
 
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
@@ -4691,8 +4782,9 @@ class GPUModelRunner(
         spec_decode_metadata: SpecDecodeMetadata | None,
         common_attn_metadata: CommonAttentionMetadata,
         slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
-    ) -> list[list[int]] | torch.Tensor:
+    ) -> tuple[list[list[int]] | torch.Tensor, torch.Tensor | None]:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        draft_token_top_ks = None
         spec_config = self.speculative_config
         assert spec_config is not None
         self._draft_probs = None
@@ -4930,7 +5022,7 @@ class GPUModelRunner(
             else:
                 mm_embed_inputs = None
 
-            draft_token_ids = self.drafter.propose(
+            draft_token_ids, draft_token_logits = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
@@ -4948,7 +5040,23 @@ class GPUModelRunner(
                     self._draft_probs = draft_probs
                     self._draft_prob_req_ids = self.input_batch.req_ids.copy()
 
-        return draft_token_ids
+            num_reqs = self.input_batch.num_reqs
+            dyn_action = self.input_batch.dyn_action
+            action_tensors = FusedTopKActionTensors(
+                cfg_boundaries=dyn_action.cfg_boundaries[:num_reqs],
+                layer_mask=dyn_action.layer_mask[:num_reqs],
+            )
+
+            # NOTE(seven-mile): The shape changes here.
+            # draft_token_logits: gamma token logits
+            # draft_token_top_ks: 1+gamma token topks
+            draft_token_top_ks = self.drafter.get_token_top_ks_from_proposals(
+                draft_token_ids,
+                draft_token_logits,
+                action_tensors=action_tensors,
+            )
+
+        return draft_token_ids, draft_token_top_ks
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         allowed_config_names = {"load_config", "model_config"}
@@ -5111,6 +5219,8 @@ class GPUModelRunner(
             and self.eplb_state.is_async
         ):
             self.eplb_state.start_async_loop()
+
+        self._reinitialize_token_top_ks_buffer()
 
         if (
             self.vllm_config.compilation_config.mode
@@ -5380,7 +5490,10 @@ class GPUModelRunner(
 
     @contextmanager
     def maybe_randomize_inputs(
-        self, input_ids: torch.Tensor | None, inputs_embeds: torch.Tensor | None
+        self,
+        input_ids: torch.Tensor | None,
+        input_top_ks: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
     ):
         """
         Randomize input_ids if VLLM_RANDOMIZE_DP_DUMMY_INPUTS is set.
@@ -5403,10 +5516,27 @@ class GPUModelRunner(
                     high=self.model_config.get_vocab_size(),
                 )
 
+            @functools.cache
+            def rand_input_top_ks() -> torch.Tensor:
+                base_top_k = self.model_config.get_num_experts_per_token()
+                return torch.randint_like(
+                    self.input_ids.gpu,
+                    low=1,
+                    high=base_top_k, # intentionally exclusive
+                    dtype=input_ids.dtype)
+
             logger.debug_once("Randomizing dummy input_ids for DP Rank")
             input_ids.copy_(rand_input_ids()[: input_ids.size(0)], non_blocking=True)
+            if input_top_ks is not None:
+                input_top_ks.copy_(
+                    rand_input_top_ks()[:input_top_ks.size(0)],
+                    non_blocking=True
+                )
             yield
             input_ids.fill_(0)
+            if input_top_ks is not None:
+                base_top_k = self.model_config.get_num_experts_per_token()
+                input_top_ks.fill_(base_top_k)
         else:
 
             @functools.cache
@@ -5682,6 +5812,7 @@ class GPUModelRunner(
             model_kwargs = self._init_model_kwargs()
             if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
                 input_ids, inputs_embeds = self._prepare_mm_inputs(num_tokens_padded)
+                input_top_ks = None
 
                 model_kwargs = {
                     **model_kwargs,
@@ -5689,10 +5820,12 @@ class GPUModelRunner(
                 }
             elif self.enable_prompt_embeds:
                 input_ids = None
+                input_top_ks = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
                 model_kwargs = self._init_model_kwargs()
             else:
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
+                input_top_ks = self.input_top_ks.gpu[:num_tokens_padded]
                 inputs_embeds = None
 
             if self.uses_mrope:
@@ -5727,7 +5860,7 @@ class GPUModelRunner(
                     num_tokens_across_dp[:] = num_tokens_padded
 
             with (
-                self.maybe_randomize_inputs(input_ids, inputs_embeds),
+                self.maybe_randomize_inputs(input_ids, input_top_ks, inputs_embeds),
                 set_forward_context(
                     attn_metadata,
                     self.vllm_config,
@@ -5736,6 +5869,7 @@ class GPUModelRunner(
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
+                    token_top_ks=input_top_ks,
                     slot_mapping=slot_mappings,
                 ),
             ):
@@ -6756,6 +6890,29 @@ class GPUModelRunner(
         assert self._init_kernel_block_sizes == kernel_block_sizes, (
             f"InputBatch kernel_block_sizes {self._init_kernel_block_sizes} "
             f"!= kv_cache kernel_block_sizes {kernel_block_sizes}"
+        )
+
+    def _reinitialize_token_top_ks_buffer(self) -> None:
+        """
+        Re-initialize the token_top_ks buffer after loading the model.
+        """
+        if not is_mixture_of_experts(self.model):
+            warnings.warn(
+                "Reinitializing token_top_ks buffer for a non-MoE model.")
+            return
+        num_moe_layers = self.model.num_moe_layers
+        base_top_k = self.model_config.get_num_experts_per_token()
+        self.input_batch.initialize_token_top_ks(num_moe_layers, base_top_k)
+        
+        self._input_top_ks = self._make_buffer(self.max_num_tokens,
+                                               num_moe_layers,
+                                               dtype=torch.int32)
+
+        self.draft_token_top_ks_cpu = torch.zeros(
+            (self.max_num_reqs, self.num_spec_tokens + 1, num_moe_layers),
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=self.pin_memory,
         )
 
     def _allocate_kv_cache_tensors(
