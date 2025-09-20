@@ -6,6 +6,8 @@ from collections.abc import Iterable
 from enum import Enum
 from typing import Callable, Literal, Optional, overload
 
+import warnings
+
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import UninitializedParameter
@@ -1417,6 +1419,7 @@ class FusedMoE(torch.nn.Module):
         do_naive_dispatch_combine: bool = (
             self.dp_size > 1
             and not self.moe_parallel_config.use_deepep_ht_kernels)
+        warnings.warn(f"Z do_naive_dispatch_combine: {do_naive_dispatch_combine}", UserWarning)
         if do_naive_dispatch_combine:
             hidden_states, router_logits = get_ep_group().dispatch(
                 hidden_states, router_logits)

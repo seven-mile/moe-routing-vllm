@@ -44,7 +44,9 @@ def _get_token_top_ks_from_proposals(
     base_top_k = model_config.get_num_experts_per_token()
     num_layers = model_config.get_total_num_layers()
 
+    print(f"Z {logits.shape=} {token_ids.shape=} {spec_len=}")
     ppls = calc_perplexity(logits, token_ids)
+    print(f"Z {ppls.tolist()=} {logits.min().item()=} {logits.max().item()=} {logits.sum(dim=-1).tolist()=}")
 
     total_topks = torch.full((num_layers, batch_size, spec_len+1), base_top_k)
     assisted_action = _get_assisted_action("configs/ppl_to_ks.py:spec_default1_mask2025")

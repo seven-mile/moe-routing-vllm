@@ -272,7 +272,8 @@ class Top1Proposer(SpeculativeProposer):
             batch_size,
             *proposal_logits.shape[1:],
         )
-
+        print(f"Z {entire_proposal_probs.shape=} {proposal_probs.shape=} {batch_size=}")
+        print(f"Z {entire_proposal_logits.shape=} {proposal_logits.shape=} {nonzero_proposal_len_indices=}")
         entire_proposal_logits[nonzero_proposal_len_indices] = \
             proposal_logits
 

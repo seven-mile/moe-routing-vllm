@@ -11,6 +11,7 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.utils import (
     moe_kernel_quantize_input)
 
+import warnings
 
 class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     """
@@ -59,6 +60,8 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                      token_scales: Optional[torch.Tensor],
                      rank_topk_ids: torch.Tensor,
                      rank_topk_weights: torch.Tensor, num_experts: int):
+
+        warnings.warn(f"Z do_dispatch: {num_experts=}", UserWarning)
 
         has_scales = token_scales is not None
 
