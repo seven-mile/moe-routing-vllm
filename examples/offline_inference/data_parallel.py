@@ -143,6 +143,10 @@ def main(
         trust_remote_code=trust_remote_code,
         max_num_seqs=max_num_seqs,
         gpu_memory_utilization=gpu_memory_utilization,
+        speculative_config={
+            "model": "Qwen/Qwen3-0.6B",
+            "num_speculative_tokens": 4,
+        },
     )
     outputs = llm.generate(prompts, sampling_params)
     # Print the outputs.
