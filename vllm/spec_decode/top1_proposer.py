@@ -98,7 +98,7 @@ class Top1Proposer(SpeculativeProposer):
 
         # Combine speculative- and non-speculative sequences into the same
         # representation.
-        proposal_tokens, proposal_probs, proposal_lens = self._merge_outputs(
+        proposal_tokens, proposal_probs, proposal_logits, proposal_lens = self._merge_outputs(
             batch_size=len(seq_group_metadata_list),
             proposal_len=proposal_len,
             maybe_sampler_output=maybe_sampler_output,
@@ -109,6 +109,7 @@ class Top1Proposer(SpeculativeProposer):
 
         proposals = SpeculativeProposals(proposal_token_ids=proposal_tokens,
                                          proposal_probs=proposal_probs,
+                                         proposal_logits=proposal_logits,
                                          proposal_lens=proposal_lens,
                                          no_proposals=maybe_sampler_output
                                          is None)
@@ -238,14 +239,20 @@ class Top1Proposer(SpeculativeProposer):
                                           device=self._device).expand(
                                               batch_size, proposal_len,
                                               self._vocab_size)
+            proposal_logits = torch.tensor(0,
+                                           dtype=torch.float32,
+                                           device=self._device).expand(
+                                               batch_size, proposal_len,
+                                               self._vocab_size)
             proposal_lens_tensor = torch.tensor(0,
                                                 dtype=torch.long,
                                                 device=self._device).expand(
                                                     len(proposal_lens))
-            return proposal_tokens, proposal_probs, proposal_lens_tensor
+            return proposal_tokens, proposal_probs, proposal_logits, proposal_lens_tensor
 
         sampler_output = maybe_sampler_output
-        proposal_tokens, proposal_probs, *_ = sampler_output_to_torch(
+        proposal_tokens, proposal_probs, _, \
+            proposal_logits, *_ = sampler_output_to_torch(
             sampler_output, sampler_transposed)
 
         # Now, reformat the output GPU tensors such that each sequence has
@@ -261,10 +268,18 @@ class Top1Proposer(SpeculativeProposer):
             *proposal_probs.shape[1:],
         )
         entire_proposal_probs[nonzero_proposal_len_indices] = proposal_probs
+        entire_proposal_logits = proposal_logits.new_zeros(
+            batch_size,
+            *proposal_logits.shape[1:],
+        )
 
-        proposal_tokens, proposal_probs = (
+        entire_proposal_logits[nonzero_proposal_len_indices] = \
+            proposal_logits
+
+        proposal_tokens, proposal_probs, proposal_logits = (
             entire_proposal_tokens,
             entire_proposal_probs,
+            entire_proposal_logits,
         )
 
         proposal_lens_tensor = torch.zeros(batch_size,
@@ -272,4 +287,4 @@ class Top1Proposer(SpeculativeProposer):
                                            device=self._device)
         proposal_lens_tensor[nonzero_proposal_len_indices] = proposal_len
 
-        return proposal_tokens, proposal_probs, proposal_lens_tensor
+        return proposal_tokens, proposal_probs, proposal_logits, proposal_lens_tensor

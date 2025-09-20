@@ -23,6 +23,9 @@ class SpeculativeProposals:
     # Probabilities of the proposal tokens according to the proposer.
     proposal_probs: torch.Tensor
 
+    # Logits of the proposal tokens according to the proposer.
+    proposal_logits: torch.Tensor
+
     # The valid length of each proposal; can be zero.
     proposal_lens: torch.Tensor
 
@@ -33,6 +36,7 @@ class SpeculativeProposals:
         return (f"SpeculativeProposals("
                 f"proposal_token_ids={self.proposal_token_ids}, "
                 f"proposal_probs={self.proposal_probs.shape}, "
+                f"proposal_logits={self.proposal_logits.shape}, "
                 f"proposal_lens={self.proposal_lens})")
 
 

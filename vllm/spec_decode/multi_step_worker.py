@@ -233,6 +233,8 @@ class MultiStepWorker(ProposerWorkerBase, DelegateWorkerBase):
                 logprobs=(
                     expanded_batch_output.logprobs[output_indices_to_retain]
                     if expanded_batch_output.logprobs is not None else None),
+                logits=(expanded_batch_output.logits[output_indices_to_retain]
+                    if expanded_batch_output.logits is not None else None),
                 sampled_token_ids=(expanded_batch_output.
                                    sampled_token_ids[output_indices_to_retain]
                                    if expanded_batch_output.sampled_token_ids

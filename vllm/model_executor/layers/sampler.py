@@ -102,6 +102,9 @@ class SamplerOutput(
     # On-device tensor containing the logprobs of each token.
     logprobs: Optional["torch.Tensor"] = None
 
+    # On-device tensor containing the logits of each token.
+    logits: Optional["torch.Tensor"] = None
+
     # Holds either (1) the pythonized sampler result (single-step scheduling)
     # or (2) what will be arguments for later deferred pythonization of the
     # sampler result (muliti-step scheduling)
@@ -248,6 +251,7 @@ class Sampler(nn.Module):
             sampling_metadata: Metadata for sampling.
         """
         assert logits is not None
+        og_logits = logits
         _, vocab_size = logits.shape
 
         # Prepare sampling tensors with pinned memory to avoid blocking.
@@ -309,7 +313,7 @@ class Sampler(nn.Module):
             # preserve GPU-side tensors in support of later
             # deferred pythonization of logprobs
             assert maybe_sampled_tokens_tensor is not None
-            on_device_tensors = (probs, logprobs, maybe_sampled_tokens_tensor)
+            on_device_tensors = (probs, logprobs, og_logits, maybe_sampled_tokens_tensor)
         else:
             # Since Pythonization has already happened, don't preserve
             # GPU-side tensors.
@@ -1111,7 +1115,7 @@ def _build_sampler_output(
     prompt_logprobs: Optional[list[Optional[PromptLogprobs]]],
     sample_logprobs: Optional[list[SampleLogprobs]],
     on_device_tensors: Optional[tuple[torch.Tensor, torch.Tensor,
-                                      torch.Tensor]],
+                                      torch.Tensor, torch.Tensor]],
     skip_sampler_cpu_output: bool = False,
 ) -> SamplerOutput:
     """Construct Python objects with the output of sampling.
@@ -1156,17 +1160,18 @@ def _build_sampler_output(
 
     # If not specified, store None values in SamplerOutput.
     if on_device_tensors is not None:
-        (sampled_token_probs, logprobs_tensor,
+        (sampled_token_probs, logprobs_tensor, logits,
          sampled_token_ids) = on_device_tensors
     else:
-        sampled_token_probs, logprobs_tensor, sampled_token_ids = (None, None,
-                                                                   None)
+        sampled_token_probs, logprobs_tensor, logits, sampled_token_ids = (None, None,
+                                                                   None, None)
 
     return SamplerOutput(
         outputs=sampler_output,
         sampled_token_probs=sampled_token_probs,
         sampled_token_ids=sampled_token_ids,
         logprobs=logprobs_tensor,
+        logits=logits,
         deferred_sample_results_args=deferred_sample_results_args)
 
 

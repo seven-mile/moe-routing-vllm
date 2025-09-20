@@ -182,6 +182,12 @@ def sampler_output_to_torch(
         dim=0,
     )
 
+    # shape: [batch_size, num_sampler_output, vocab_size]
+    sampled_token_logits = torch.stack(
+        [sampler_output.logits for sampler_output in sampler_output_list],
+        dim=0,
+    )
+
     # shape: [batch_size, num_sampler_output]
     sampled_token_ids = torch.stack(
         [
@@ -194,6 +200,7 @@ def sampler_output_to_torch(
     if sampler_transposed:
         sampled_token_probs = sampled_token_probs.transpose(0, 1)
         sampled_token_logprobs = sampled_token_logprobs.transpose(0, 1)
+        sampled_token_logits = sampled_token_logits.transpose(0, 1)
         sampled_token_ids = sampled_token_ids.transpose(0, 1)
 
     if sampler_output_list[0].hidden_states is not None:
@@ -212,7 +219,7 @@ def sampler_output_to_torch(
         sampled_hidden_states = None
 
     return (sampled_token_ids, sampled_token_probs, sampled_token_logprobs,
-            sampled_hidden_states)
+            sampled_token_logits, sampled_hidden_states)
 
 
 def maybe_mock_device_tensors(sampler_output: SamplerOutput, batch_size: int,
