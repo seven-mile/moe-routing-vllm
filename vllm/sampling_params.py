@@ -16,6 +16,7 @@ from vllm.logger import init_logger
 from vllm.logits_process import LogitsProcessor
 from vllm.tokenizers import TokenizerLike
 from vllm.v1.serial_utils import PydanticMsgspecMixin
+from vllm.utils.udf import UserDefinedFunctionConfig, load_user_defined_function
 
 logger = init_logger(__name__)
 
@@ -238,6 +239,7 @@ class SamplingParams(
     allowed_token_ids: list[int] | None = None
     """If provided, the engine will construct a logits processor which only
     retains scores for the given token ids."""
+    dyn_assisted_action_config_str: str = "null"
     extra_args: dict[str, Any] | None = None
     """Arbitrary additional args, that can be used by custom sampling
     implementations, plugins, etc. Not used by any in-tree sampling
@@ -281,6 +283,7 @@ class SamplingParams(
         structured_outputs: StructuredOutputsParams | None = None,
         logit_bias: dict[int, float] | dict[str, float] | None = None,
         allowed_token_ids: list[int] | None = None,
+        dyn_assisted_action_config: UserDefinedFunctionConfig | None = None,
         extra_args: dict[str, Any] | None = None,
         skip_clone: bool = False,
     ) -> "SamplingParams":
@@ -322,6 +325,8 @@ class SamplingParams(
             structured_outputs=structured_outputs,
             logit_bias=logit_bias,
             allowed_token_ids=allowed_token_ids,
+            dyn_assisted_action_config_str=dyn_assisted_action_config.dumps() \
+                if dyn_assisted_action_config is not None else "null",
             extra_args=extra_args,
             skip_clone=skip_clone,
         )
@@ -475,6 +480,20 @@ class SamplingParams(
                 "stop strings are only supported when detokenize is True. "
                 "Set detokenize=True to use stop."
             )
+        
+        if cfg := self.dyn_assisted_action_config:
+            if not isinstance(cfg, UserDefinedFunctionConfig):
+                raise ValueError(
+                    f"dyn_assisted_action_config must be a UserDefinedFunctionConfig, got {type(cfg)}")
+            if not cfg.file or not cfg.function:
+                raise ValueError(
+                    "Both file and function must be specified in dyn_assisted_action_config")
+            # Try loading the function to catch errors early.
+            try:
+                load_user_defined_function(cfg)
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to load dyn_assisted_action_config: {e}") from e
 
     def _verify_greedy_sampling(self) -> None:
         if self.n > 1:
@@ -564,6 +583,10 @@ class SamplingParams(
     def bad_words_token_ids(self) -> list[list[int]] | None:
         # For internal use only. Backward compatibility not guaranteed
         return self._bad_words_token_ids
+    
+    @property
+    def dyn_assisted_action_config(self) -> UserDefinedFunctionConfig | None:
+        return UserDefinedFunctionConfig.loads(self.dyn_assisted_action_config_str)
 
     def clone(self) -> "SamplingParams":
         """Deep copy, but maybe not the LogitsProcessor objects.
