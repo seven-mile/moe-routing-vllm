@@ -1189,6 +1189,7 @@ class FusedMoE(torch.nn.Module):
 
         # DeepSeekv2 uses grouped_top_k
         if use_grouped_topk:
+            assert False, "expert weights mask NYI"
             assert topk_group is not None
             assert num_expert_group is not None
             topk_weights, topk_ids = grouped_topk(
@@ -1203,6 +1204,7 @@ class FusedMoE(torch.nn.Module):
             if indices_type is not None:
                 topk_ids = topk_ids.to(dtype=indices_type)
         elif custom_routing_function is None:
+            assert renormalize, "non-renormalized weights mask NYI"
             topk_weights, topk_ids, token_expert_indices = fused_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -1211,6 +1213,7 @@ class FusedMoE(torch.nn.Module):
                 indices_type=indices_type,
             )
         else:
+            assert False, "expert weights mask NYI"
             topk_weights, topk_ids = custom_routing_function(
                 hidden_states=hidden_states,
                 gating_output=router_logits,

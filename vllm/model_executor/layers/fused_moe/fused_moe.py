@@ -9,6 +9,7 @@ from typing import Any, Callable, Optional
 import torch
 
 import vllm.envs as envs
+from vllm.forward_context import get_forward_context
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
@@ -860,6 +861,21 @@ def vllm_topk_softmax(topk_weights: torch.Tensor, topk_indices: torch.Tensor,
         token_expert_indices,
         gating_output,
     )
+
+    token_top_ks = get_forward_context().token_top_ks
+    if token_top_ks is not None:
+        # TODO: Layerwise top-k not supported yet.
+        print(f"Z Applying token top-k {token_top_ks.tolist()=}")
+        # Mask out the invalid top-k weights for each token.
+        assert token_top_ks.ndim == 2, "Layerwise not supported"
+        token_top_ks = token_top_ks.view(-1)
+        # print(f"Z {token_top_ks.shape=}, {topk_indices.shape=}")
+        assert token_top_ks.shape == topk_indices.shape[:-1], "token_top_ks shape mismatch"
+        num_tokens, topk = topk_weights.shape
+        topk_mask = torch.arange(topk, device=topk_weights.device) >= token_top_ks[:, None]
+        topk_indices.masked_fill_(topk_mask, -1)
+        topk_weights.masked_fill_(topk_mask, 0.0)
+
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
@@ -1491,14 +1507,17 @@ def fused_moe(
     """
 
     if use_grouped_topk:
+        assert False, "expert weights mask NYI"
         assert num_expert_group is not None and topk_group is not None
         topk_weights, topk_ids = grouped_topk(hidden_states, gating_output,
                                               topk, renormalize,
                                               num_expert_group, topk_group)
     elif custom_routing_function is None:
+        assert renormalize, "non-renormalized weights mask NYI"
         topk_weights, topk_ids, token_expert_indices = fused_topk(
             hidden_states, gating_output, topk, renormalize)
     else:
+        assert False, "expert weights mask NYI"
         topk_weights, topk_ids = custom_routing_function(
             hidden_states, gating_output, topk, renormalize)
 
