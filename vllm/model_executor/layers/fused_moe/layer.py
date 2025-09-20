@@ -1738,6 +1738,7 @@ class FusedMoE(CustomOp):
 
         # DeepSeekv2 uses grouped_top_k
         if use_grouped_topk:
+            assert False, "expert weights mask NYI"
             assert topk_group is not None
             assert num_expert_group is not None
             topk_weights, topk_ids = grouped_topk(
@@ -1763,6 +1764,7 @@ class FusedMoE(CustomOp):
             if routed_scaling_factor is not None:
                 topk_weights *= routed_scaling_factor
         elif custom_routing_function is None:
+            assert renormalize, "non-renormalized weights mask NYI"
             topk_weights, topk_ids, token_expert_indices = fused_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -1771,6 +1773,7 @@ class FusedMoE(CustomOp):
                 indices_type=indices_type,
             )
         else:
+            assert False, "expert weights mask NYI"
             topk_weights, topk_ids = custom_routing_function(
                 hidden_states=hidden_states,
                 gating_output=router_logits,

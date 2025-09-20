@@ -280,6 +280,8 @@ class ForwardContext:
 
     ubatch_slices: Optional[UBatchSlices] = None
 
+    token_top_ks: Optional[torch.Tensor] = None
+
     def __post_init__(self):
         assert self.cudagraph_runtime_mode.valid_runtime_modes(), \
             f"Invalid cudagraph runtime mode: {self.cudagraph_runtime_mode}"
@@ -303,7 +305,8 @@ def create_forward_context(
         dp_metadata: Optional[DPMetadata] = None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         batch_descriptor: Optional[BatchDescriptor] = None,
-        ubatch_slices: Optional[UBatchSlices] = None):
+        ubatch_slices: Optional[UBatchSlices] = None,
+        token_top_ks: Optional[torch.Tensor] = None):
     return ForwardContext(no_compile_layers=vllm_config.compilation_config.
                           static_forward_context,
                           virtual_engine=virtual_engine,
@@ -311,7 +314,8 @@ def create_forward_context(
                           dp_metadata=dp_metadata,
                           cudagraph_runtime_mode=cudagraph_runtime_mode,
                           batch_descriptor=batch_descriptor,
-                          ubatch_slices=ubatch_slices)
+                          ubatch_slices=ubatch_slices,
+                          token_top_ks=token_top_ks)
 
 
 @contextmanager
@@ -338,7 +342,8 @@ def set_forward_context(
         num_tokens_across_dp: Optional[torch.Tensor] = None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         batch_descriptor: Optional[BatchDescriptor] = None,
-        ubatch_slices: Optional[UBatchSlices] = None):
+        ubatch_slices: Optional[UBatchSlices] = None,
+        token_top_ks: Optional[torch.Tensor] = None):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
     Here we can inject common logic for every model forward pass.
@@ -358,7 +363,8 @@ def set_forward_context(
     forward_context = create_forward_context(attn_metadata, vllm_config,
                                              virtual_engine, dp_metadata,
                                              cudagraph_runtime_mode,
-                                             batch_descriptor, ubatch_slices)
+                                             batch_descriptor, ubatch_slices,
+                                             token_top_ks)
 
     try:
         with override_forward_context(forward_context):
