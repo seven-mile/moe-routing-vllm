@@ -1263,6 +1263,12 @@ class ModelConfig:
     def get_num_layers(self, parallel_config: "ParallelConfig") -> int:
         start, end = self.get_layers_start_end_indices(parallel_config)
         return end - start
+    
+    def get_total_num_layers(self) -> int:
+        if (self.hf_text_config.model_type == "deepseek_mtp"
+                or self.hf_config.model_type == "mimo_mtp"):
+            return getattr(self.hf_text_config, "num_nextn_predict_layers", 0)
+        return getattr(self.hf_text_config, "num_hidden_layers", 0)
 
     def get_num_layers_by_block_type(
         self,
@@ -1318,6 +1324,30 @@ class ModelConfig:
                     f"{block_type.value} layers")
 
             return sum(t == 1 for t in attn_type_list[start:end])
+
+    def get_num_experts(self) -> int:
+        num_expert_names = [
+            "num_experts",  # General
+            "n_routed_experts",  # DeepSeek
+            "moe_num_experts",  # Dbrx
+            "num_local_experts",  # Mixtral
+        ]
+        for name in num_expert_names:
+            num_experts = getattr(self.hf_text_config, name, 0)
+            if num_experts > 0:
+                return num_experts
+        return 0
+
+    def get_num_experts_per_token(self) -> int:
+        num_expert_names = [
+            "num_experts_per_tok",
+            "moe_top_k",
+        ]
+        for name in num_expert_names:
+            num_experts = getattr(self.hf_text_config, name, 0)
+            if num_experts > 0:
+                return num_experts
+        return 0
 
     def get_multimodal_config(self) -> "MultiModalConfig":
         """

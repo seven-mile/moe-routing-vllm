@@ -1,13 +1,58 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import TYPE_CHECKING
+
+from vllm.forward_context import set_forward_context
 from vllm.sequence import (ExecuteModelRequest, SequenceData,
                            SequenceGroupMetadata, get_all_seq_ids)
 from vllm.spec_decode.interfaces import (SpeculativeProposals,
                                          SpeculativeScorer, SpeculativeScores)
+from vllm.spec_decode.util import calc_perplexity, load_action_from_config
+
+if TYPE_CHECKING:
+    from vllm.config import ModelConfig
+
+import functools
+import torch
 
 SeqId = int
 TargetSeqId = int
+
+@functools.lru_cache(maxsize=None)
+def _get_assisted_action(config):
+    action = load_action_from_config(config)
+    return action
+
+
+def _get_token_top_ks_from_proposals(
+        proposals: SpeculativeProposals,
+        model_config: "ModelConfig"
+    ) -> torch.Tensor:
+    """Get token top-k values from proposal probabilities.
+
+    Args:
+        proposals: SpeculativeProposals object containing proposal probabilities.
+    Returns:
+        A tensor of shape (batch_size, max_proposal_len) containing the top-k
+        values for each token in the proposals.
+    """
+    logits = proposals.proposal_logits
+    token_ids = proposals.proposal_token_ids
+    batch_size, spec_len = token_ids.shape
+    
+    base_top_k = model_config.get_num_experts_per_token()
+    num_layers = model_config.get_total_num_layers()
+
+    ppls = calc_perplexity(logits, token_ids)
+
+    total_topks = torch.full((num_layers, batch_size, spec_len+1), base_top_k)
+    assisted_action = _get_assisted_action("configs/ppl_to_ks.py:spec_default1_mask2025")
+    spec_topks = assisted_action(ppls, model_config.hf_config)
+    # The output token guides the top-k of the input token.
+    total_topks[:, :, -spec_len-1:-1] = spec_topks
+    # FIXME: Layerwise topks.
+    return total_topks[0]
 
 
 class MQAScorer(SpeculativeScorer):
@@ -22,6 +67,11 @@ class MQAScorer(SpeculativeScorer):
             get_all_seq_ids(execute_model_req.seq_group_metadata_list)) + 1
         all_proposal_tokens = proposals.proposal_token_ids.tolist()
         all_proposal_lengths = proposals.proposal_lens.tolist()
+        
+        # Calculate proposal ppls.
+        verify_token_top_ks = _get_token_top_ks_from_proposals(
+            proposals, self._scorer_worker.model_config)
+
         for i, seq_group_metadata in enumerate(
                 execute_model_req.seq_group_metadata_list):
             if all_proposal_lengths[i] == 0:
@@ -64,9 +114,13 @@ class MQAScorer(SpeculativeScorer):
             )
             target_seq_group_metadata_list.append(new_seq_group_metadata)
 
-        target_sampler_output = self._scorer_worker.execute_model(
-            execute_model_req=execute_model_req.clone(
-                seq_group_metadata_list=target_seq_group_metadata_list))
+        with set_forward_context(
+            {}, self._scorer_worker.vllm_config,
+            token_top_ks=verify_token_top_ks.to(self._device)
+        ):
+            target_sampler_output = self._scorer_worker.execute_model(
+                execute_model_req=execute_model_req.clone(
+                    seq_group_metadata_list=target_seq_group_metadata_list))
 
         target_sampler_output = target_sampler_output[0]
 

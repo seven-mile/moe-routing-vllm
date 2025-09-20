@@ -271,6 +271,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         allow_zero_draft_token_step: Optional[bool] = True,
         enable_lm_head_weight_load: Optional[bool] = False,
         num_spec_prefill_steps: int = 1,
+        use_assisted_topk: bool = False,
     ):
         """
         Create a SpecDecodeWorker.
@@ -334,6 +335,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         # Lazy initialization.
         self.scorer: SpeculativeScorer
         self.disable_mqa_scorer = disable_mqa_scorer
+        self.use_assisted_topk = use_assisted_topk
 
         # Hidden states from target model to pass to proposer
         # in the subsequent step.
@@ -374,6 +376,8 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
                                                   device_type=self.device)
 
         scorer_cls: Type[SpeculativeScorer]
+        if self.use_assisted_topk:
+            assert not self.disable_mqa_scorer, "Assisted Dynamic Top-k only supports MQAScorer"
         if self.disable_mqa_scorer:
             scorer_cls = BatchExpansionTop1Scorer
             logger.info("[Speculative Decoding] Use batch "
@@ -385,7 +389,8 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
 
         self.scorer = scorer_cls(scorer_worker=self.scorer_worker,
                                  device=self.device,
-                                 vocab_size=self._vocab_size)
+                                 vocab_size=self._vocab_size,
+                                 use_assisted_topk=self.use_assisted_topk)
 
         self._configure_model_sampler_for_spec_decode()
 
