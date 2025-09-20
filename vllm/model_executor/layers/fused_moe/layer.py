@@ -247,6 +247,8 @@ def FusedMoE(
             "Redundant experts are only supported with EPLB."
         )
 
+    moe_layer_idx = len(vllm_config.compilation_config.static_all_moe_layers)
+
     max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
     # Create ExpertMapManager to handle expert mapping and placement for EP.
@@ -272,6 +274,10 @@ def FusedMoE(
             top_k=top_k,
             global_num_experts=global_num_experts,
             eplb_state=eplb_state,
+            # NOTE: This relies on that MTP layers are at the end of the model
+            # and moe_layer_idx is assigned in order. If that ever changes,
+            # we should add a more robust way to determine the index.
+            moe_layer_idx=moe_layer_idx,
             renormalize=renormalize,
             use_grouped_topk=use_grouped_topk,
             num_expert_group=num_expert_group,

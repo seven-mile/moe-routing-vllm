@@ -16,6 +16,7 @@ from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.collection_utils import swap_dict_values
 from vllm.utils.torch_utils import PIN_MEMORY
+from vllm.utils.udf import UserDefinedFunctionConfig
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import (
@@ -63,6 +64,7 @@ class CachedRequestState:
     # for pooling models
     pooling_params: PoolingParams | None = None
     pooling_states: PoolingStates | None = None
+    dyn_assisted_action_config_str: str = "null"
 
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
@@ -87,6 +89,91 @@ class CachedRequestState:
         if idx - self.num_prompt_tokens < len(self.output_token_ids):
             return self.output_token_ids[idx - self.num_prompt_tokens]
         return -1
+
+
+@dataclass
+class DynAssistedActionState:
+    cfg_boundaries: torch.Tensor
+    layer_mask: torch.Tensor
+    cfg_boundaries_cpu_tensor: torch.Tensor
+    layer_mask_cpu_tensor: torch.Tensor
+
+    def sync_to_gpu(self, num_reqs: int) -> None:
+        self.cfg_boundaries[:num_reqs].copy_(
+            self.cfg_boundaries_cpu_tensor[:num_reqs],
+            non_blocking=True,
+        )
+        self.layer_mask[:num_reqs].copy_(
+            self.layer_mask_cpu_tensor[:num_reqs],
+            non_blocking=True,
+        )
+
+    @staticmethod
+    def _extract_vectorized_action_params(
+        action_config_str: str,
+    ) -> tuple[bool, list[float], list[int]]:
+        cfg = UserDefinedFunctionConfig.loads(action_config_str)
+        if cfg is None:
+            return False, [], [0, 0, 1]
+
+        if cfg.function != "spec_with_list_layer_range":
+            return False, [], [0, 0, 1]
+
+        args = tuple(cfg.args or ())
+        kwargs = dict(cfg.kwargs or ())
+
+        cfg_vals = kwargs.get("cfg", args[0] if len(args) >= 1 else None)
+        layer_range = kwargs.get("layer_range", args[1] if len(args) >= 2 else None)
+
+        if cfg_vals is None:
+            return False, [], [0, 0, 1]
+
+        cfg_list = [float(x) for x in cfg_vals]
+        if layer_range is None:
+            layer_range_list = [0, 0, 1]
+        else:
+            layer_range_list = [int(x) for x in layer_range]
+            if len(layer_range_list) == 2:
+                layer_range_list.append(1)
+            elif len(layer_range_list) != 3:
+                return False, [], [0, 0, 1]
+
+        return True, cfg_list, layer_range_list
+
+    def update_from_config(
+        self,
+        req_index: int,
+        action_config_str: str,
+    ) -> None:
+        is_vec, cfg_vals, layer_range = self._extract_vectorized_action_params(
+            action_config_str
+        )
+        assert is_vec, (
+            "Only vectorized assisted_action config is supported; "
+            "fallback path has been removed."
+        )
+
+        cfg_width = self.cfg_boundaries_cpu_tensor.shape[1]
+        num_layers = self.layer_mask_cpu_tensor.shape[1]
+
+        self.cfg_boundaries_cpu_tensor[req_index].fill_(0.0)
+        self.layer_mask_cpu_tensor[req_index].fill_(False)
+
+        cfg_len = min(len(cfg_vals), cfg_width)
+        if cfg_len > 0:
+            rev_vals = list(reversed(cfg_vals[:cfg_len]))
+            self.cfg_boundaries_cpu_tensor[
+                req_index, cfg_width - cfg_len :
+            ] = torch.tensor(rev_vals, dtype=torch.float32)
+
+        start, stop, step = layer_range
+        if step != 0:
+            s, e, st = slice(start, stop, step).indices(num_layers)
+            idx = list(range(s, e, st))
+            if idx:
+                self.layer_mask_cpu_tensor[
+                    req_index, torch.tensor(idx, dtype=torch.int64)
+                ] = True
 
 
 class InputBatch:
@@ -142,6 +229,7 @@ class InputBatch:
             pin_memory=False,
         )
         self.is_token_ids = self.is_token_ids_tensor.numpy()
+        self.token_top_ks_cpu_tensor: torch.Tensor | None = None
         # Store prompt embeddings per request to avoid OOM from large upfront
         # allocation if max_model_len is big.
         # Maps req_index -> tensor of shape (num_prompt_tokens, hidden_size)
@@ -301,11 +389,71 @@ class InputBatch:
         self.sampled_token_ids_cpu: torch.Tensor | None = None
         self.async_copy_ready_event: torch.Event | None = None
 
+        # Dynamic assisted action CPU state for fused top-k path.
+        self._dyn_action: DynAssistedActionState | None = None
+
+    def initialize_token_top_ks(self, num_moe_layers: int, base_top_k: int):
+        self.token_top_ks_cpu_tensor = torch.full(
+            (self.max_num_reqs, self.max_model_len, num_moe_layers),
+            base_top_k,
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=False,
+        )
+
+        self._dyn_action = DynAssistedActionState(
+            cfg_boundaries=torch.zeros(
+                (self.max_num_reqs, int(base_top_k)),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            layer_mask=torch.zeros(
+                (self.max_num_reqs, int(num_moe_layers)),
+                dtype=torch.bool,
+                device=self.device,
+            ),
+            cfg_boundaries_cpu_tensor=torch.zeros(
+                (self.max_num_reqs, int(base_top_k)),
+                dtype=torch.float32,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            ),
+            layer_mask_cpu_tensor=torch.zeros(
+                (self.max_num_reqs, int(num_moe_layers)),
+                dtype=torch.bool,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            ),
+        )
+
+    @property
+    def dyn_action(self) -> DynAssistedActionState:
+        assert self._dyn_action is not None, "Dynamic assisted action state is not initialized."
+        return self._dyn_action
+
+    def sync_dyn_assisted_action_to_gpu(self, num_reqs: int) -> None:
+        if self._dyn_action is None:
+            return
+        self.dyn_action.sync_to_gpu(num_reqs)
+
+    def update_dyn_assisted_action(
+        self,
+        req_index: int,
+        action_config_str: str,
+    ) -> None:
+        self.dyn_action.update_from_config(req_index, action_config_str)
+
     @property
     def req_ids(self) -> list[str]:
         # None elements should only be present transiently
         # while performing state updates to the batch.
         return cast(list[str], self._req_ids)
+    
+    @property
+    def token_top_ks_cpu(self) -> np.ndarray:
+        if self.token_top_ks_cpu_tensor is None:
+            raise ValueError("token_top_ks_cpu_tensor is not initialized.")
+        return self.token_top_ks_cpu_tensor.numpy()
 
     def _register_add_request(self, request: "CachedRequestState") -> int:
         """Track add-request operations for logits processors.
@@ -479,10 +627,17 @@ class InputBatch:
             # No LoRA
             self.request_lora_mapping[req_index] = 0
 
+        if self._dyn_action is not None:
+            self.update_dyn_assisted_action(
+                req_index, request.dyn_assisted_action_config_str
+            )
+
         return req_index
 
     def update_req_spec_token_ids(
-        self, request: CachedRequestState, scheduled_spec_tokens: dict[str, list[int]]
+        self, request: CachedRequestState,
+        scheduled_spec_tokens: dict[str, list[int]],
+        scheduled_spec_token_top_ks: dict[str, list[list[int]]],
     ) -> None:
         req_id = request.req_id
         req_index = self.req_id_to_index[req_id]
@@ -494,6 +649,7 @@ class InputBatch:
         # even when speculative decoding is enabled.
         cur_spec_token_ids.clear()
         spec_token_ids = scheduled_spec_tokens.get(req_id, ())
+        spec_token_top_ks = (scheduled_spec_token_top_ks.get(req_id, ()))
         num_spec_tokens = len(spec_token_ids)
         request.prev_num_draft_len = num_spec_tokens
         if not spec_token_ids:
@@ -506,6 +662,9 @@ class InputBatch:
         end_token_index = start_index + num_spec_tokens
         self.token_ids_cpu[req_index, start_index:end_token_index] = spec_token_ids
         self.is_token_ids[req_index, start_index:end_token_index] = True
+        # NOTE(seven-mile): token topks is 1+gamma, the first k assists
+        # the last one of non-spec tokens.
+        self.token_top_ks_cpu[req_index, start_index-1:end_token_index] = spec_token_top_ks
         cur_spec_token_ids.extend(spec_token_ids)
 
     def remove_request(self, req_id: str) -> int | None:
@@ -527,6 +686,11 @@ class InputBatch:
         self.req_output_token_ids[req_index] = None
         self.spec_token_ids[req_index].clear()
         self.block_table.clear_row(req_index)
+
+        if self._dyn_action is not None:
+            dyn_action = self.dyn_action
+            dyn_action.cfg_boundaries_cpu_tensor[req_index].fill_(0.0)
+            dyn_action.layer_mask_cpu_tensor[req_index].fill_(False)
 
         # LoRA
         lora_id = self.request_lora_mapping[req_index]
@@ -599,6 +763,22 @@ class InputBatch:
             self.num_computed_tokens_cpu[i2],
             self.num_computed_tokens_cpu[i1],
         )
+        if self._dyn_action is not None:
+            dyn_action = self.dyn_action
+            (
+                dyn_action.cfg_boundaries_cpu_tensor[i1],
+                dyn_action.cfg_boundaries_cpu_tensor[i2],
+            ) = (
+                dyn_action.cfg_boundaries_cpu_tensor[i2].clone(),
+                dyn_action.cfg_boundaries_cpu_tensor[i1].clone(),
+            )
+            (
+                dyn_action.layer_mask_cpu_tensor[i1],
+                dyn_action.layer_mask_cpu_tensor[i2],
+            ) = (
+                dyn_action.layer_mask_cpu_tensor[i2].clone(),
+                dyn_action.layer_mask_cpu_tensor[i1].clone(),
+            )
 
         # NOTE: the following is unsafe
         # self.token_ids_cpu[i1, ...], self.token_ids_cpu[i2, ...], =\
@@ -755,6 +935,16 @@ class InputBatch:
             self.num_computed_tokens_cpu[empty_index] = self.num_computed_tokens_cpu[
                 last_req_index
             ]
+            if self._dyn_action is not None:
+                dyn_action = self.dyn_action
+                dyn_action.cfg_boundaries_cpu_tensor[empty_index] = (
+                    dyn_action.cfg_boundaries_cpu_tensor[last_req_index]
+                )
+                dyn_action.cfg_boundaries_cpu_tensor[last_req_index].fill_(0.0)
+                dyn_action.layer_mask_cpu_tensor[empty_index] = (
+                    dyn_action.layer_mask_cpu_tensor[last_req_index]
+                )
+                dyn_action.layer_mask_cpu_tensor[last_req_index].fill_(False)
             self.block_table.move_row(last_req_index, empty_index)
 
             self.request_lora_mapping[empty_index] = self.request_lora_mapping[

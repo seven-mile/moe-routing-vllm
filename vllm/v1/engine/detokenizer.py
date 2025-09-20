@@ -30,6 +30,7 @@ INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
 class IncrementalDetokenizer:
     def __init__(self):
         self.token_ids: list[int] = []
+        self.token_top_ks: list[list[int]] = []
 
     @property
     def output_token_ids(self) -> list[int]:
@@ -38,8 +39,16 @@ class IncrementalDetokenizer:
     def num_output_tokens(self) -> int:
         return len(self.token_ids)
 
-    def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:
+    def update(
+        self,
+        new_token_ids: list[int],
+        stop_terminated: bool,
+        new_token_top_ks: list[list[int]] | None = None
+    ) -> str | None:
         self.token_ids.extend(new_token_ids)
+        if new_token_top_ks is not None:
+            assert len(new_token_top_ks) == len(new_token_ids)
+            self.token_top_ks.extend(new_token_top_ks)
         return None
 
     def get_next_output_text(self, finished: bool, delta: bool) -> str:
@@ -92,7 +101,12 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
         # Generation data
         self.output_text = ""
 
-    def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:
+    def update(
+        self,
+        new_token_ids: list[int],
+        stop_terminated: bool,
+        new_token_top_ks: list[list[int]] | None = None
+    ) -> str | None:
         """
         Update RequestState for the request_id by:
             1) Detokenize the new token ids incrementally.
@@ -109,13 +123,22 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
             # based on include_stop_str_in_output parameter.
             skipped_stop_token_id = new_token_ids[-1]
             new_token_ids = new_token_ids[:-1]
+            if new_token_top_ks is not None:
+                skipped_stop_token_top_k = new_token_top_ks[-1]
+                new_token_top_ks = new_token_top_ks[:-1]
+            else:
+                skipped_stop_token_top_k = None
         else:
             skipped_stop_token_id = None
+            skipped_stop_token_top_k = None
 
         # 1) Detokenize the new token ids incrementally.
         stop_check_offset = len(self.output_text)
-        for new_token_id in new_token_ids:
+        for idx, new_token_id in enumerate(new_token_ids):
             self.token_ids.append(new_token_id)
+            if new_token_top_ks is not None:
+                assert len(new_token_top_ks) == len(new_token_ids)
+                self.token_top_ks.append(new_token_top_ks[idx])
             self.output_text += self.decode_next(new_token_id)
             # Support min_tokens, see https://github.com/vllm-project/vllm/pull/22014
             if self.min_tokens and self.num_output_tokens() <= self.min_tokens:
@@ -124,6 +147,8 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
         if skipped_stop_token_id is not None:
             # Cleanup after skipping detokenization.
             self.token_ids.append(skipped_stop_token_id)
+            if skipped_stop_token_top_k is not None:
+                self.token_top_ks.append(skipped_stop_token_top_k)
 
         # 2) Evaluate stop strings.
         stop_string = None

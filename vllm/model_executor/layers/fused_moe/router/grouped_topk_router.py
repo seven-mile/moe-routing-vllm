@@ -250,6 +250,7 @@ class GroupedTopKRouter(BaseRouter):
         self,
         top_k: int,
         global_num_experts: int,
+        moe_layer_idx: int,
         num_expert_group: int,
         topk_group: int,
         renormalize: bool = True,
@@ -263,6 +264,7 @@ class GroupedTopKRouter(BaseRouter):
             top_k=top_k,
             global_num_experts=global_num_experts,
             eplb_state=eplb_state,
+            moe_layer_idx=moe_layer_idx,
         )
         self.num_expert_group = num_expert_group
         self.topk_group = topk_group

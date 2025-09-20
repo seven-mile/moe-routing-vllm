@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from importlib.util import find_spec
+import json
+import os
+import threading
+import time
+from dataclasses import dataclass
 from typing import Any, cast
 
 import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
 from vllm.config import (
     CUDAGraphMode,
@@ -19,7 +25,7 @@ from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
-from vllm.model_executor.models import supports_multimodal
+from vllm.model_executor.models.interfaces import is_mixture_of_experts, supports_multimodal
 from vllm.model_executor.models.deepseek_eagle3 import Eagle3DeepseekV2ForCausalLM
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
@@ -39,9 +45,11 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     sample_with_exponential_noise,
 )
 from vllm.v1.sample.sampler import _SAMPLING_EPS
+from vllm.v1.spec_decode.fused_kernel import fused_logits_to_total_topk
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
+    calc_distribution_perplexity,
     compute_new_slot_mapping,
     copy_and_expand_eagle_inputs_kernel,
     eagle_prepare_inputs_padded_kernel,
@@ -58,6 +66,69 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+@dataclass
+class FusedTopKActionTensors:
+    cfg_boundaries: torch.Tensor
+    layer_mask: torch.Tensor
+
+
+class PPLDumpManager:
+    def __init__(self, dump_dir: str, max_tokens_per_file: int, dump_interval: float):
+        self.dump_dir = dump_dir
+        self.max_tokens_per_file = max_tokens_per_file
+        self.dump_interval = dump_interval
+        self.token_ppls: list[float] = []
+        self.file_idx = 0
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+
+        os.makedirs(self.dump_dir, exist_ok=True)
+
+        self.dump_thread = threading.Thread(target=self._dump_loop, daemon=True)
+        self.dump_thread.start()
+
+    def add_token_ppls(self, ppls: torch.Tensor):
+        ppl_list = ppls.view(-1).tolist()
+        with self.lock:
+            self.token_ppls.extend(ppl_list)
+            if len(self.token_ppls) >= self.max_tokens_per_file:
+                self._dump_to_file_unsafe()
+
+    def _dump_loop(self):
+        while not self.stop_event.is_set():
+            time.sleep(self.dump_interval)
+            if not self.stop_event.is_set():
+                with self.lock:
+                    if self.token_ppls:
+                        self._dump_to_file_unsafe()
+
+    def _dump_to_file_unsafe(self):
+        if not self.token_ppls:
+            return
+
+        file_path = os.path.join(self.dump_dir, f"ppls_{self.file_idx}.json")
+        self.file_idx += 1
+
+        with open(file_path, "w") as f:
+            json.dump(self.token_ppls, f)
+
+        logger.info("Dumped %d token ppls to %s", len(self.token_ppls), file_path)
+        self.token_ppls = []
+
+    def shutdown(self):
+        self.stop_event.set()
+        self.dump_thread.join(timeout=5.0)
+        with self.lock:
+            if self.token_ppls:
+                self._dump_to_file_unsafe()
+
+    def __del__(self):
+        try:
+            self.shutdown()
+        except Exception:
+            pass
+
+
 class SpecDecodeBaseProposer:
     def __init__(
         self,
@@ -67,6 +138,7 @@ class SpecDecodeBaseProposer:
         runner=None,
     ):
         self.vllm_config = vllm_config
+        self.runner = runner
         assert vllm_config.speculative_config is not None
         self.speculative_config = vllm_config.speculative_config
         self.draft_model_config = self.speculative_config.draft_model_config
@@ -238,6 +310,16 @@ class SpecDecodeBaseProposer:
             and self.speculative_config.draft_sample_method == "probabilistic"
         )
         self._last_draft_probs: torch.Tensor | None = None
+        ppl_dump_dir = os.getenv("PPL_DUMP_DIR")
+        if ppl_dump_dir:
+            self.ppl_dump_manager = PPLDumpManager(
+                dump_dir=ppl_dump_dir,
+                max_tokens_per_file=1000000,
+                dump_interval=5.0,
+            )
+            logger.info("PPL dump manager initialized with dump_dir=%s", ppl_dump_dir)
+        else:
+            self.ppl_dump_manager = None
 
         self._slot_mapping_buffer = torch.zeros(
             self.max_positions, dtype=torch.int64, device=device
@@ -459,7 +541,7 @@ class SpecDecodeBaseProposer:
         slot_mappings: dict[str, torch.Tensor]
         | list[dict[str, torch.Tensor]]
         | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         self.num_speculative_tokens = num_speculative_tokens
         self._last_draft_probs = None
         batch_size = common_attn_metadata.batch_size()
@@ -534,28 +616,39 @@ class SpecDecodeBaseProposer:
             self.model.model.set_skip_topk(True)
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
+        logits = self.model.compute_logits(sample_hidden_states)
 
         # No draft tokens requested (e.g. Dynamic SD decided K=0).
         # The prefill forward pass above already ran to keep the drafter
         # KV cache in sync, so just return an empty tensor.
         if self.num_speculative_tokens == 0:
-            return torch.empty(
+            draft_token_ids = torch.empty(
                 batch_size,
                 0,
                 device=sample_hidden_states.device,
                 dtype=torch.int64,
             )
+            draft_token_logits = torch.empty(
+                batch_size,
+                0,
+                0,
+                device=sample_hidden_states.device,
+                dtype=sample_hidden_states.dtype,
+            )
+            return draft_token_ids, draft_token_logits
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
-            draft_token_ids, draft_probs = self._sample_draft_tokens(
-                sample_hidden_states, sampling_metadata
+            draft_token_ids, draft_probs = self._sample_from_logits(
+                logits, sampling_metadata
             )
             if draft_probs is not None:
                 self._last_draft_probs = draft_probs.view(
                     -1, self.num_speculative_tokens, draft_probs.shape[-1]
                 ).contiguous()
-            return draft_token_ids.view(-1, self.num_speculative_tokens)
+            return draft_token_ids.view(-1, self.num_speculative_tokens), logits.view(
+                -1, self.num_speculative_tokens, logits.shape[-1]
+            )
 
         if self.uses_mrope:
             positions = self.mrope_positions[:, token_indices_to_sample]
@@ -569,8 +662,8 @@ class SpecDecodeBaseProposer:
             # (which read via _get_positions) use the correct values.
             self.positions[:batch_size] = positions
 
-        draft_token_ids, draft_probs = self._sample_draft_tokens(
-            sample_hidden_states, sampling_metadata
+        draft_token_ids, draft_probs = self._sample_from_logits(
+            logits, sampling_metadata
         )
         draft_probs_list = None if draft_probs is None else [draft_probs]
 
@@ -586,6 +679,7 @@ class SpecDecodeBaseProposer:
 
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
+        draft_token_logits_list = [logits]
 
         cudagraph_runtime_mode, input_batch_size, batch_size_across_dp = (
             self._determine_batch_execution_and_padding(batch_size)
@@ -672,19 +766,71 @@ class SpecDecodeBaseProposer:
                     last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states[:batch_size]
-            draft_token_ids, draft_probs = self._sample_draft_tokens(
-                last_hidden_states[:batch_size], sampling_metadata
+            logits = self.model.compute_logits(last_hidden_states[:batch_size])
+            draft_token_ids, draft_probs = self._sample_from_logits(
+                logits, sampling_metadata
             )
             if draft_probs is not None:
                 assert draft_probs_list is not None
                 draft_probs_list.append(draft_probs)
             draft_token_ids_list.append(draft_token_ids)
+            draft_token_logits_list.append(logits)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        # [batch_size, num_speculative_tokens, vocab_size]
+        draft_token_logits = torch.stack(draft_token_logits_list, dim=1)
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
-        return draft_token_ids
+        return draft_token_ids, draft_token_logits
+
+    def get_token_top_ks_from_proposals(
+        self,
+        token_ids: torch.Tensor,
+        logits: torch.Tensor,
+        action_tensors: FusedTopKActionTensors | None = None,
+    ) -> torch.Tensor:
+        model_config = self.vllm_config.model_config
+        batch_size, _ = token_ids.shape
+
+        base_top_k = model_config.get_num_experts_per_token()
+        assert self.runner is not None
+        target_model = self.runner.get_model()
+        assert is_mixture_of_experts(target_model), (
+            "The model must be a mixture of experts model."
+        )
+        assert target_model.num_moe_layers > 0, "No MoE layers found in the model."
+
+        assert token_ids.device.type == self.device.type, (
+            f"Expected token_ids to be on device {self.device.type}, "
+            f"but got {token_ids.device.type}."
+        )
+        assert logits.device.type == self.device.type, (
+            f"Expected logits to be on device {self.device.type}, "
+            f"but got {logits.device.type}."
+        )
+        assert action_tensors is not None, (
+            "Missing dyn action tensors; fallback path has been removed."
+        )
+
+        cfg_boundaries = action_tensors.cfg_boundaries
+        layer_mask = action_tensors.layer_mask
+        assert cfg_boundaries.shape[0] == batch_size
+        assert layer_mask.shape[0] == batch_size
+
+        total_topks = fused_logits_to_total_topk(
+            logits=logits,
+            cfg_boundaries=cfg_boundaries,
+            layer_mask=layer_mask,
+            base_k=base_top_k,
+            apply_last_token=envs.VLLM_DYN_TOPK_APPLY_LAST_TOKEN,
+        )
+
+        if self.ppl_dump_manager is not None:
+            ppls = calc_distribution_perplexity(logits)
+            self.ppl_dump_manager.add_token_ppls(ppls)
+
+        return total_topks.contiguous()
 
     def _update_positions_dependent_metadata(
         self,

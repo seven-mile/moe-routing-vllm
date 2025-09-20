@@ -537,6 +537,7 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
+        token_top_ks: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Run expert routing and the fused MoE kernel via the quant method.
 
@@ -549,6 +550,10 @@ class MoERunner(MoERunnerInterface):
         )
 
         if self.routed_experts.quant_method.is_monolithic:
+            if token_top_ks is not None:
+                raise NotImplementedError(
+                    "token_top_ks not compatible with monolithic quant method"
+                )
             # Monolithic kernels: pass router_logits to routed_experts
             fused_out = self.routed_experts.forward_monolithic(
                 x=hidden_states,
@@ -562,6 +567,7 @@ class MoERunner(MoERunnerInterface):
                 router_logits=router_logits,
                 topk_indices_dtype=self._quant_method.topk_indices_dtype,
                 input_ids=input_ids,
+                token_top_ks=token_top_ks,
             )
 
             fused_out = self.routed_experts.forward_modular(
@@ -725,19 +731,34 @@ class MoERunner(MoERunnerInterface):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        token_top_ks: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         # For naive dispatch/combine Dp/Ep, dispatch the hidden states and
         # router logits to all experts.
         # NOTE: this will be removed once all kernels are migrated into the
         # MoEKernel framework.
         if self.do_naive_dispatch_combine:
-            result = get_ep_group().dispatch_router_logits(
-                hidden_states,
-                router_logits,
-                self.moe_config.is_sequence_parallel,
+            extra_tensors = (
+                {"token_top_ks": token_top_ks} if token_top_ks is not None else None
             )
-            assert len(result) == 2
-            hidden_states, router_logits = result
+            if extra_tensors is not None:
+                hidden_states, router_logits, extra_tensors_combined = (
+                    get_ep_group().dispatch_router_logits(
+                        hidden_states,
+                        router_logits,
+                        self.moe_config.is_sequence_parallel,
+                        extra_tensors=extra_tensors,
+                    )
+                )
+                token_top_ks = extra_tensors_combined.get("token_top_ks")
+            else:
+                result = get_ep_group().dispatch_router_logits(
+                    hidden_states,
+                    router_logits,
+                    self.moe_config.is_sequence_parallel,
+                )
+                assert len(result) == 2
+                hidden_states, router_logits = result
 
         # NOTE: Similar with DP, PCP also needs dispatch and combine. For
         # simplicity, AgRsAll2All was added separately for PCP here. Maybe
@@ -751,8 +772,13 @@ class MoERunner(MoERunnerInterface):
                 router_logits,
                 dim=0,
             )
+            if token_top_ks is not None:
+                token_top_ks = get_pcp_group().all_gather(
+                    token_top_ks,
+                    dim=0,
+                )
 
-        return hidden_states, router_logits
+        return hidden_states, router_logits, token_top_ks
 
     def _maybe_combine(
         self,
@@ -812,12 +838,15 @@ class MoERunner(MoERunnerInterface):
                 router_logits, _ = self.gate(hidden_states)
 
         with self._sequence_parallel_context():
+            ctx = get_forward_context()
+            token_top_ks = ctx.token_top_ks
             # TODO(bnell): parts of the dispatch/combine steps will go away once
             # #32567 lands and the remaining kernels are made MKs.  The PCP
             # code will probably remain
-            hidden_states, router_logits = self._maybe_dispatch(
+            hidden_states, router_logits, token_top_ks = self._maybe_dispatch(
                 hidden_states,
                 router_logits,
+                token_top_ks,
             )
 
             shared_output, hidden_states = self._apply_quant_method(
@@ -825,6 +854,7 @@ class MoERunner(MoERunnerInterface):
                 router_logits=router_logits,
                 shared_experts_input=shared_experts_input,
                 input_ids=input_ids,
+                token_top_ks=token_top_ks,
             )
 
             return self._maybe_combine(

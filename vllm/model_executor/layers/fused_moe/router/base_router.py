@@ -5,6 +5,7 @@ from collections.abc import Callable
 
 import torch
 
+from vllm import envs
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
@@ -149,6 +150,7 @@ class BaseRouter(FusedMoERouter):
         top_k: int,
         global_num_experts: int,
         eplb_state: EplbLayerState | None = None,
+        moe_layer_idx: int | None = None,
     ):
         """
         Args:
@@ -159,6 +161,7 @@ class BaseRouter(FusedMoERouter):
         super().__init__(eplb_state=eplb_state)
         self.top_k = top_k
         self.global_num_experts = global_num_experts
+        self.moe_layer_idx = moe_layer_idx
         self.capture_fn: Callable[[torch.Tensor], None] | None = None
 
     def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
@@ -194,6 +197,33 @@ class BaseRouter(FusedMoERouter):
                 record_enabled=eplb_state.should_record_tensor,
             )
         return topk_ids
+
+    def _apply_token_top_ks(
+        self,
+        topk_indices: torch.Tensor,
+        topk_weights: torch.Tensor,
+        token_top_ks: torch.Tensor | None = None,
+    ):
+        if token_top_ks is None:
+            return
+        moe_layer_idx = self.moe_layer_idx
+        assert moe_layer_idx is not None
+        # Mask out the invalid top-k weights for each token.
+        if token_top_ks.ndim == 2:
+            assert moe_layer_idx is not None, "moe_layer_idx must be provided for layerwise dynamic top-k"
+            token_top_ks = token_top_ks[:, moe_layer_idx]
+        else:
+            assert token_top_ks.ndim == 1, "token_top_ks must be 1D or 2D"
+        assert token_top_ks.shape == topk_indices.shape[:-1], (
+            f"token_top_ks shape mismatch: {token_top_ks.shape} vs {topk_indices.shape}"
+        )
+        num_tokens, topk = topk_weights.shape
+        topk_mask = torch.arange(topk, device=topk_weights.device) >= token_top_ks[:, None]
+        if topk_indices.dtype == torch.uint32:
+            topk_indices = topk_indices.view(torch.int32)
+        if not envs.VLLM_DYN_TOPKS_NO_DROP_TOKENS:
+            topk_indices.masked_fill_(topk_mask, -1)
+        topk_weights.masked_fill_(topk_mask, 0.0)
 
     def _convert_indices_dtype(
         self, topk_ids: torch.Tensor, indices_type: torch.dtype | None
@@ -237,6 +267,7 @@ class BaseRouter(FusedMoERouter):
         topk_indices_dtype: torch.dtype | None = None,
         *,
         input_ids: torch.Tensor | None = None,
+        token_top_ks: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Route the input hidden states to the top-k experts based on the
@@ -272,7 +303,14 @@ class BaseRouter(FusedMoERouter):
         # Step 3: Apply EPLB mapping
         topk_ids = self._apply_eplb_mapping(topk_ids)
 
-        # Step 4: Convert indices dtype
+        # Step 4: Apply token_top_ks if available
+        self._apply_token_top_ks(
+            topk_indices=topk_ids,
+            topk_weights=topk_weights,
+            token_top_ks=token_top_ks,
+        )
+
+        # Step 5: Convert indices dtype
         topk_ids = self._convert_indices_dtype(topk_ids, topk_indices_dtype)
 
         return topk_weights, topk_ids

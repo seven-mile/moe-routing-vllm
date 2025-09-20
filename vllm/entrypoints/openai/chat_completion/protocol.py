@@ -21,6 +21,7 @@ from vllm.entrypoints.chat_utils import (
 )
 from vllm.entrypoints.openai.engine.protocol import (
     AnyResponseFormat,
+    DynAssistedActionConfig,
     DeltaMessage,
     FunctionCall,
     FunctionDefinition,
@@ -112,6 +113,7 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     # ``None`` if (a) the request was aborted before any forward pass,
     # or (b) ``enable_return_routed_experts`` is off server-side.
     routed_experts: str | None = None
+    token_top_ks: list[list[int]] | None = None
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -143,6 +145,7 @@ class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
     stop_reason: int | str | None = None
     # not part of the OpenAI spec but for tracing the tokens
     token_ids: list[int] | None = None
+    token_top_ks: list[list[int]] | None = None
 
 
 class ChatCompletionStreamResponse(OpenAIBaseModel):
@@ -266,6 +269,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     prompt_logprobs: int | None = None
     allowed_token_ids: list[int] | None = None
     bad_words: list[str] = Field(default_factory=list)
+    dyn_assisted_action_config: DynAssistedActionConfig | None = None
     # --8<-- [end:chat-completion-sampling-params]
 
     # --8<-- [start:chat-completion-extra-params]
@@ -648,6 +652,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
             thinking_token_budget=self.thinking_token_budget,
+            dyn_assisted_action_config=(
+                self.dyn_assisted_action_config.to_udf()
+                if self.dyn_assisted_action_config else None
+            ),
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone

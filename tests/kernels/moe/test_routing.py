@@ -352,6 +352,7 @@ def test_fused_topk(
         global_num_experts=global_num_experts,
         renormalize=renormalize,
         eplb_state=eplb_state,
+        layer_idx=0,
     )
 
     hidden_states, router_logits = make_test_data(m, k, global_num_experts)
@@ -402,6 +403,7 @@ def test_fused_topk_bias(
         global_num_experts=global_num_experts,
         renormalize=renormalize,
         eplb_state=eplb_state,
+        layer_idx=0,
     )
 
     hidden_states, router_logits = make_test_data(m, k, global_num_experts)
@@ -470,6 +472,7 @@ def test_grouped_topk(
         global_num_experts=global_num_experts,
         renormalize=renormalize,
         eplb_state=eplb_state,
+        layer_idx=0,
     )
 
     hidden_states, router_logits = make_test_data(m, k, global_num_experts)
@@ -540,6 +543,7 @@ def test_custom(
         custom_routing_function=custom_routing_function,
         renormalize=renormalize,
         eplb_state=eplb_state,
+        layer_idx=0,
     )
 
     hidden_states, router_logits = make_test_data(m, k, global_num_experts)
@@ -579,6 +583,7 @@ def test_custom(
 #         top_k=top_k,
 #         global_num_experts=global_num_experts,
 #         eplb_state=eplb_state,
+#         layer_idx=0,
 #     )
 
 #     hidden_states, router_logits = make_test_data(m, k, global_num_experts)

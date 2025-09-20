@@ -10,6 +10,7 @@ from typing import Any
 import torch
 
 import vllm.envs as envs
+from vllm.forward_context import get_forward_context
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger

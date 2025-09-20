@@ -120,6 +120,7 @@ class FusedTopKRouter(BaseRouter):
         self,
         top_k: int,
         global_num_experts: int,
+        moe_layer_idx: int,
         scoring_func: str = "softmax",
         renormalize: bool = True,
         eplb_state: EplbLayerState | None = None,
@@ -128,6 +129,7 @@ class FusedTopKRouter(BaseRouter):
             top_k=top_k,
             global_num_experts=global_num_experts,
             eplb_state=eplb_state,
+            moe_layer_idx=moe_layer_idx,
         )
         self.renormalize = renormalize
         self.scoring_func = scoring_func

@@ -39,6 +39,7 @@ class FusedMoERouter(ABC):
         topk_indices_dtype: torch.dtype | None = None,
         *,
         input_ids: torch.Tensor | None = None,
+        token_top_ks: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
@@ -49,6 +50,7 @@ class FusedMoERouter(ABC):
         topk_indices_dtype: torch.dtype | None = None,
         *,
         input_ids: torch.Tensor | None = None,
+        token_top_ks: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Route the input hidden states to the top-k experts based on the
@@ -69,6 +71,7 @@ class FusedMoERouter(ABC):
             router_logits,
             topk_indices_dtype=topk_indices_dtype,
             input_ids=input_ids,
+            token_top_ks=token_top_ks,
         )
 
         # Write routing data for non-monolithic path (Triton, etc.)

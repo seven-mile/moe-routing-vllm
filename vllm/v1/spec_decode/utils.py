@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
+import torch.nn.functional as F
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -599,3 +600,23 @@ def unconditional_to_conditional_rates(rates: list[float]) -> list[float]:
     """Convert per-position unconditional rates to per-position conditional
     rates for the early-terminating rejection loop (c_i = p_i / p_{i-1})."""
     return [p / q if q > 0.0 else 0.0 for p, q in zip(rates, [1.0, *rates[:-1]])]
+
+
+def calc_perplexity(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+    logits = logits.float()
+    assert logits.shape[:-1] == token_ids.shape, \
+        f"Logits shape {logits.shape} does not match token_ids shape {token_ids.shape}"
+    loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), token_ids.reshape(-1), reduction='none')
+    perplexity = torch.exp(loss)
+    return perplexity.view(token_ids.shape)
+
+
+def calc_distribution_perplexity(logits: torch.Tensor) -> torch.Tensor:
+    logits = logits.float()
+    log_probs = F.log_softmax(logits, dim=-1)   # (..., V)
+    probs = log_probs.exp()                     # (..., V)
+
+    entropy = -(probs * log_probs).sum(dim=-1)  # (...)
+    perplexity = torch.exp(entropy)
+
+    return perplexity

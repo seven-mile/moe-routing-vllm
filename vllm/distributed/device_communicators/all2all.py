@@ -53,10 +53,10 @@ class AgRsAll2AllManager(All2AllManagerBase):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         is_sequence_parallel: bool = False,
-        extra_tensors: list[torch.Tensor] | None = None,
+        extra_tensors: dict[str, torch.Tensor] | None = None,
     ) -> (
         tuple[torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]
+        | tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]
     ):
         """
         Gather hidden_states and router_logits from all dp ranks.
@@ -68,9 +68,11 @@ class AgRsAll2AllManager(All2AllManagerBase):
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
         assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
 
+        extra_tensor_keys: list[str] = []
         tensors_to_gather = [hidden_states, router_logits]
         if extra_tensors is not None:
-            tensors_to_gather.extend(extra_tensors)
+            extra_tensor_keys = list(extra_tensors.keys())
+            tensors_to_gather.extend(extra_tensors[key] for key in extra_tensor_keys)
 
         gathered_tensors = dist_group.all_gatherv(
             tensors_to_gather,
@@ -79,7 +81,11 @@ class AgRsAll2AllManager(All2AllManagerBase):
         )
 
         if extra_tensors is not None:
-            return (gathered_tensors[0], gathered_tensors[1], gathered_tensors[2:])
+            gathered_extra_tensors = {
+                key: gathered_tensors[idx + 2]
+                for idx, key in enumerate(extra_tensor_keys)
+            }
+            return gathered_tensors[0], gathered_tensors[1], gathered_extra_tensors
         return gathered_tensors[0], gathered_tensors[1]
 
     def dispatch(
@@ -88,10 +94,10 @@ class AgRsAll2AllManager(All2AllManagerBase):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         is_sequence_parallel: bool = False,
-        extra_tensors: list[torch.Tensor] | None = None,
+        extra_tensors: dict[str, torch.Tensor] | None = None,
     ) -> (
         tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]
     ):
         """
         Gather hidden_states and router_logits from all dp ranks.
@@ -103,9 +109,11 @@ class AgRsAll2AllManager(All2AllManagerBase):
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
         assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
 
+        extra_tensor_keys: list[str] = []
         tensors_to_gather = [hidden_states, topk_weights, topk_ids]
         if extra_tensors is not None:
-            tensors_to_gather.extend(extra_tensors)
+            extra_tensor_keys = list(extra_tensors.keys())
+            tensors_to_gather.extend(extra_tensors[key] for key in extra_tensor_keys)
 
         gathered_tensors = dist_group.all_gatherv(
             tensors_to_gather,
@@ -119,8 +127,11 @@ class AgRsAll2AllManager(All2AllManagerBase):
 
         if extra_tensors is None:
             return hidden_states, topk_weights, topk_ids
-
-        return hidden_states, topk_weights, topk_ids, gathered_tensors[3:]
+        gathered_extra_tensors = {
+            key: gathered_tensors[idx + 3]
+            for idx, key in enumerate(extra_tensor_keys)
+        }
+        return hidden_states, topk_weights, topk_ids, gathered_extra_tensors
 
     def combine(
         self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
@@ -166,7 +177,7 @@ class DeepEPAll2AllManagerBase(All2AllManagerBase):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         is_sequence_parallel: bool = False,
-        extra_tensors: list[torch.Tensor] | None = None,
+        extra_tensors: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
@@ -176,10 +187,10 @@ class DeepEPAll2AllManagerBase(All2AllManagerBase):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         is_sequence_parallel: bool = False,
-        extra_tensors: list[torch.Tensor] | None = None,
+        extra_tensors: dict[str, torch.Tensor] | None = None,
     ) -> (
         tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]
     ):
         raise NotImplementedError
 
@@ -216,7 +227,6 @@ class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
             num_rdma_bytes = 0
             num_qps_per_rank = 1
 
-        assert num_rdma_bytes is not None
         assert num_qps_per_rank is not None
         # TODO: remove platform-specific logic
         # once ROCm DeepEP is updated with the latest APIs.
@@ -485,10 +495,10 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         is_sequence_parallel: bool = False,
-        extra_tensors: list[torch.Tensor] | None = None,
+        extra_tensors: dict[str, torch.Tensor] | None = None,
     ) -> (
         tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]
     ):
         raise NotImplementedError
 

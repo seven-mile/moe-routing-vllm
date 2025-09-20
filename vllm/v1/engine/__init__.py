@@ -180,6 +180,7 @@ class EngineCoreOutput(
 ):  # type: ignore[call-arg]
     request_id: str
     new_token_ids: list[int]
+    new_token_top_ks: list[list[int]]
 
     new_logprobs: LogprobsLists | None = None
     new_prompt_logprobs_tensors: LogprobsTensors | None = None

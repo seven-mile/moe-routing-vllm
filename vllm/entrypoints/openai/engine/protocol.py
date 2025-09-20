@@ -8,6 +8,7 @@ from http import HTTPStatus
 from typing import Any, ClassVar, Literal, TypeAlias
 
 import regex as re
+from frozendict import deepfreeze
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -21,6 +22,7 @@ from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.utils import random_uuid
 from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.utils.udf import UserDefinedFunctionConfig
 
 logger = init_logger(__name__)
 
@@ -97,6 +99,24 @@ class ModelCard(OpenAIBaseModel):
 class ModelList(OpenAIBaseModel):
     object: str = "list"
     data: list[ModelCard] = Field(default_factory=list)
+
+
+class DynAssistedActionConfig(BaseModel):
+    file: str
+    function: str
+    args: list[Any] | None = None
+    kwargs: dict[str, Any] | None = None
+
+    def to_udf(self) -> UserDefinedFunctionConfig:
+        args = deepfreeze(self.args) if self.args is not None else None
+        kwargs = deepfreeze(sorted(self.kwargs.items())) if self.kwargs is not None else None
+        return UserDefinedFunctionConfig(
+            file=self.file,
+            function=self.function,
+            args=args,
+            kwargs=kwargs,
+        )
+
 
 
 class PromptTokenUsageInfo(OpenAIBaseModel):

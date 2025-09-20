@@ -415,6 +415,8 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        scheduled_spec_decode_token_top_ks: dict[str, list[list[int]]] = {}
+        scheduled_req_dyn_assisted_action_configs: dict[str, str] = {}
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -579,6 +581,10 @@ class Scheduler(SchedulerInterface):
             token_budget -= num_new_tokens
             req_index += 1
 
+            # Dynamic top-k related.
+            scheduled_req_dyn_assisted_action_configs[request.request_id] = \
+                request.sampling_params.dyn_assisted_action_config_str
+
             # Speculative decode related.
             if request.spec_token_ids:
                 num_scheduled_spec_tokens = (
@@ -589,9 +595,13 @@ class Scheduler(SchedulerInterface):
                 )
                 if num_scheduled_spec_tokens > 0:
                     spec_token_ids = request.spec_token_ids
+                    spec_token_top_ks = request.spec_token_top_ks
                     if len(spec_token_ids) > num_scheduled_spec_tokens:
                         spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
+                        spec_token_top_ks = spec_token_top_ks[:num_scheduled_spec_tokens+1]
                     scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
+                    scheduled_spec_decode_token_top_ks[request.request_id] = spec_token_top_ks
+
 
                 # New spec tokens will be set in `update_draft_token_ids` before the
                 # next step when applicable.
@@ -977,6 +987,11 @@ class Scheduler(SchedulerInterface):
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
 
+                # Dynamic top-k related.
+                scheduled_req_dyn_assisted_action_configs[request.request_id] = (
+                    request.sampling_params.dyn_assisted_action_config_str
+                )
+
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
@@ -1062,6 +1077,10 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            scheduled_spec_decode_token_top_ks=(
+                scheduled_spec_decode_token_top_ks),
+            scheduled_req_dyn_assisted_action_configs=(
+                scheduled_req_dyn_assisted_action_configs),
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
             preempted_req_ids={req.request_id for req in preempted_reqs},
@@ -1467,6 +1486,7 @@ class Scheduler(SchedulerInterface):
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
         sampled_token_ids = model_runner_output.sampled_token_ids
+        token_top_ks = model_runner_output.token_top_ks
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
@@ -1591,6 +1611,10 @@ class Scheduler(SchedulerInterface):
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
+                new_token_top_ks = (
+                    token_top_ks[req_index][:len(new_token_ids)]
+                    if token_top_ks else []
+                )
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
@@ -1691,6 +1715,7 @@ class Scheduler(SchedulerInterface):
                     EngineCoreOutput(
                         request_id=req_id,
                         new_token_ids=new_token_ids,
+                        new_token_top_ks=new_token_top_ks,
                         finish_reason=finish_reason,
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
@@ -1898,9 +1923,10 @@ class Scheduler(SchedulerInterface):
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
-        for req_id, spec_token_ids in zip(
+        for req_id, spec_token_ids, spec_token_top_ks in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
+            draft_token_ids.draft_token_top_ks,
         ):
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
@@ -1918,6 +1944,8 @@ class Scheduler(SchedulerInterface):
                 metadata = request.structured_output_request
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
             request.spec_token_ids = spec_token_ids
+            # NOTE(seven-mile): 1+gamma token topks.
+            request.spec_token_top_ks = spec_token_top_ks
 
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput

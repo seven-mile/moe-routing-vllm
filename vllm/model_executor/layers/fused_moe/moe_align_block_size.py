@@ -98,7 +98,10 @@ def moe_align_block_size(
     )
 
     if expert_map is not None and not ignore_invalid_experts:
-        expert_ids = expert_map[expert_ids]
+        expert_ids = torch.where(
+            expert_ids == -1, -1,
+            expert_map[expert_ids.clamp(min=0)]
+        )
 
     return sorted_ids, expert_ids, num_tokens_post_pad
 

@@ -413,6 +413,7 @@ class OpenAIServingCompletion(OpenAIServing):
                                     if request.return_token_ids
                                     else None
                                 ),
+                                token_top_ks=as_list(output.token_top_ks),
                             )
                         ],
                     )
@@ -568,6 +569,7 @@ class OpenAIServingCompletion(OpenAIServing):
                         as_list(output.token_ids) if request.return_token_ids else None
                     ),
                     routed_experts=routed_experts_b64,
+                    token_top_ks=as_list(output.token_top_ks),
                 )
                 choices.append(choice_data)
 
