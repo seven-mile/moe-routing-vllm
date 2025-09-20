@@ -1154,6 +1154,18 @@ class ModelConfig:
     def get_total_num_hidden_layers(self) -> int:
         return self.model_arch_config.total_num_hidden_layers
 
+    def get_num_experts_per_token(self) -> int:
+        """Returns the number of experts activated per token in the model."""
+        num_expert_names = [
+            "num_experts_per_tok",
+            "moe_top_k",
+        ]
+        for name in num_expert_names:
+            num_experts = getattr(self.hf_text_config, name, 0)
+            if num_experts > 0:
+                return num_experts
+        assert self.get_num_experts() == 0, "Config not found."
+
     def get_layers_start_end_indices(
         self, parallel_config: ParallelConfig
     ) -> tuple[int, int]:

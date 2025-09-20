@@ -250,29 +250,13 @@ class PPLXAll2AllManager(All2AllManagerBase):
         if self.internode:
             # inter-node communication needs nvshmem,
             # intra-node communication uses p2p mapping directly
-            from pplx_kernels.nvshmem import (  # type: ignore[import-not-found]
-                nvshmem_alloc_empty_unique_id,
-                nvshmem_get_unique_id,
-                nvshmem_init,
-            )
-
+            from pplx_kernels.nvshmem import nvshmem_init
+            from cuda.core.experimental import Device  # type: ignore[import]
             logger.debug(
-                "Initialize NVSHMEM for pplx_kernels: rank=%d, world size=%d",
-                self.rank,
-                self.world_size,
-            )
-            uid = (
-                nvshmem_get_unique_id()
-                if self.rank == 0
-                else nvshmem_alloc_empty_unique_id()
-            )
-            dist.broadcast(
-                uid,
-                src=dist.get_process_group_ranks(self.cpu_group)[0],
-                group=self.cpu_group,
-            )
-            logger.debug("PPLX NVSHMEM UID = %s", uid)
-            nvshmem_init(uid, self.rank, self.world_size)
+                "Initialize NVSHMEM for pplx_kernels: "
+                "rank=%d, world size=%d", self.rank, self.world_size)
+            dev = Device(torch.cuda.current_device())
+            nvshmem_init(self.rank, self.rank, self.world_size, dev)
 
         self.handle_cache = Cache()
 

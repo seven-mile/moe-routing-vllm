@@ -72,6 +72,7 @@ def get_fake_sample_fn() -> SamplerOutput:
                     device="cuda",
                     dtype=torch.int32,
                 ),
+                sampled_token_top_ks=None,
                 logprobs_tensors=None,
             )
         num_sampled_tokens = spec_decode_metadata.cu_num_sampled_tokens[0].item() + 1
@@ -86,6 +87,7 @@ def get_fake_sample_fn() -> SamplerOutput:
             sampled_token_ids=torch.tensor(
                 [sampled_token_ids], device="cuda", dtype=torch.int32
             ),
+            sampled_token_top_ks=None,
             logprobs_tensors=None,
         )
 

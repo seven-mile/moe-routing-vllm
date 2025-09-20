@@ -410,6 +410,8 @@ class FusedMoE(CustomOp):
         compilation_config.static_forward_context[prefix] = self
         compilation_config.static_all_moe_layers.append(prefix)
         self.layer_name = prefix
+        from vllm.model_executor.models.utils import extract_layer_index
+        self.layer_idx = extract_layer_index(prefix)
 
         self.enable_eplb = enable_eplb
         self.eplb_state = EplbLayerState()
@@ -528,6 +530,7 @@ class FusedMoE(CustomOp):
             top_k=top_k,
             global_num_experts=self.global_num_experts,
             eplb_state=self.eplb_state,
+            layer_idx=self.layer_idx,
             renormalize=renormalize,
             use_grouped_topk=use_grouped_topk,
             num_expert_group=num_expert_group,
@@ -1669,6 +1672,7 @@ class FusedMoE(CustomOp):
         full_hidden_states: torch.Tensor,
         full_router_logits: torch.Tensor,
         has_separate_shared_experts: bool,
+        full_token_top_ks: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         assert self.batched_hidden_states is not None
         assert self.batched_router_logits is not None
@@ -1690,6 +1694,10 @@ class FusedMoE(CustomOp):
             chunk_size = chunk_end - chunk_start
             hidden_states = full_hidden_states[chunk_start:chunk_end, :]
             router_logits = full_router_logits[chunk_start:chunk_end, :]
+            if full_token_top_ks is not None:
+                token_top_ks = full_token_top_ks[chunk_start:chunk_end]
+            else:
+                token_top_ks = None
 
             assert self.batched_hidden_states is not None
             assert self.batched_router_logits is not None
@@ -1719,6 +1727,10 @@ class FusedMoE(CustomOp):
 
             # Matrix multiply.
             if self.quant_method.is_monolithic:
+                if token_top_ks is not None:
+                    raise NotImplementedError(
+                        "token_top_ks not compatible with monolithic quant method"
+                    )
                 final_hidden_states = self.quant_method.apply_monolithic(
                     layer=self,
                     x=staged_hidden_states,
@@ -1728,6 +1740,7 @@ class FusedMoE(CustomOp):
                 topk_weights, topk_ids = self.router.select_experts(
                     hidden_states=staged_hidden_states,
                     router_logits=staged_router_logits,
+                    token_top_ks=token_top_ks,
                 )
 
                 final_hidden_states = self.quant_method.apply(
@@ -1806,6 +1819,9 @@ class FusedMoE(CustomOp):
         self.ensure_moe_quant_config_init()
         self.ensure_dp_chunking_init()
 
+        ctx = get_forward_context()
+        token_top_ks = ctx.token_top_ks
+
         has_separate_shared_experts = (
             not self.quant_method.mk_owns_shared_expert
             and self.shared_experts is not None
@@ -1828,7 +1844,7 @@ class FusedMoE(CustomOp):
 
         if use_chunked_impl:
             return self.forward_impl_chunked(
-                hidden_states, router_logits, has_separate_shared_experts
+                hidden_states, router_logits, has_separate_shared_experts, token_top_ks
             )
 
         # NOTE(rob): once we finish migrating all the quant methods to use
@@ -1836,8 +1852,9 @@ class FusedMoE(CustomOp):
         do_naive_dispatch_combine = (
             self.dp_size > 1 and not self.quant_method.supports_internal_mk
         )
+        if token_top_ks is not None and do_naive_dispatch_combine:
+            raise RuntimeError("naive dispatch/combine not compatible with dynamic top-k")
 
-        ctx = get_forward_context()
         sp_ctx = (
             ctx.dp_metadata.sp_local_sizes(self.sp_size)
             if ctx.dp_metadata
@@ -1912,6 +1929,10 @@ class FusedMoE(CustomOp):
             x_orig = orig_hidden_states if do_naive_dispatch_combine else hidden_states
 
             if self.quant_method.is_monolithic:
+                if token_top_ks is not None:
+                    raise NotImplementedError(
+                        "token_top_ks not compatible with monolithic quant method"
+                    )
                 final_hidden_states = self.quant_method.apply_monolithic(
                     layer=self,
                     x=x,
@@ -1921,6 +1942,7 @@ class FusedMoE(CustomOp):
                 topk_weights, topk_ids = self.router.select_experts(
                     hidden_states=x_orig,
                     router_logits=router_logits,
+                    token_top_ks=token_top_ks,
                 )
 
                 final_hidden_states = self.quant_method.apply(

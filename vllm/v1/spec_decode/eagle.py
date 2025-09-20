@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
+import json
+import os
+import threading
+import time
 from dataclasses import replace
 from importlib.util import find_spec
 from typing import cast
@@ -9,6 +13,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.config import (
     CUDAGraphMode,
     VllmConfig,
@@ -19,7 +24,8 @@ from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
-from vllm.model_executor.models import supports_multimodal
+from vllm.model_executor.models.interfaces import (supports_multimodal,
+                                                   is_mixture_of_experts)
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
@@ -27,6 +33,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.triton_utils import triton
 from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.utils.udf import UserDefinedFunctionConfig, load_user_defined_function
 from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
@@ -43,6 +50,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
+    calc_perplexity,
     eagle_prepare_inputs_padded_kernel,
     eagle_prepare_next_token_padded_kernel,
 )
@@ -55,7 +63,87 @@ logger = init_logger(__name__)
 PADDING_SLOT_ID = -1
 
 
+class PPLDumpManager:
+    def __init__(self, dump_dir: str, max_tokens_per_file: int,
+                 dump_interval: float):
+        """Initialize PPL dump manager with background thread.
+        
+        Args:
+            dump_dir: Directory to save PPL dump files
+            max_tokens_per_file: Maximum number of tokens before triggering dump
+            dump_interval: Interval in seconds between periodic dumps
+        """
+        self.dump_dir = dump_dir
+        self.max_tokens_per_file = max_tokens_per_file
+        self.dump_interval = dump_interval
+        self.token_ppls = []
+        self.file_idx = 0
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        
+        # Create dump directory if it doesn't exist
+        if not os.path.exists(self.dump_dir):
+            os.makedirs(self.dump_dir)
+        
+        # Start background thread
+        self.dump_thread = threading.Thread(target=self._dump_loop, daemon=True)
+        self.dump_thread.start()
+    
+    def add_token_ppls(self, ppls: torch.Tensor):
+        """Add token PPLs to the buffer.
+        
+        Args:
+            ppls: Tensor of perplexity values
+        """
+        ppl_list = ppls.view(-1).tolist()
+        with self.lock:
+            self.token_ppls.extend(ppl_list)
+            # Trigger immediate dump if capacity exceeded
+            if len(self.token_ppls) >= self.max_tokens_per_file:
+                self._dump_to_file_unsafe()
+    
+    def _dump_loop(self):
+        """Background thread loop for periodic dumping."""
+        while not self.stop_event.is_set():
+            time.sleep(self.dump_interval)
+            if not self.stop_event.is_set():
+                with self.lock:
+                    if self.token_ppls:
+                        self._dump_to_file_unsafe()
+    
+    def _dump_to_file_unsafe(self):
+        """Dump PPLs to file. Must be called with lock held."""
+        if not self.token_ppls:
+            return
+            
+        file_path = os.path.join(self.dump_dir, f"ppls_{self.file_idx}.json")
+        self.file_idx += 1
+        
+        with open(file_path, "w") as f:
+            json.dump(self.token_ppls, f)
+        
+        logger.info(f"Dumped {len(self.token_ppls)} token ppls to {file_path}")
+        self.token_ppls = []
+    
+    def shutdown(self):
+        """Shutdown the manager and dump remaining data."""
+        self.stop_event.set()
+        self.dump_thread.join(timeout=5.0)
+        
+        # Dump any remaining data
+        with self.lock:
+            if self.token_ppls:
+                self._dump_to_file_unsafe()
+    
+    def __del__(self):
+        """Cleanup on deletion."""
+        try:
+            self.shutdown()
+        except Exception:
+            pass
+
 class SpecDecodeBaseProposer:
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -231,6 +319,19 @@ class SpecDecodeBaseProposer:
             1, len(self.tree_choices) + 1, device=device, dtype=torch.int32
         ).repeat(max_batch_size, 1)
 
+        # Initialize PPL dump manager if enabled
+        # ppl_dump_dir = "/root/dev/repos/moe-routing/data/dyn_topk/vllm_eagle/ppl"
+        ppl_dump_dir = os.getenv("PPL_DUMP_DIR")
+        if ppl_dump_dir:
+            self.ppl_dump_manager = PPLDumpManager(
+                dump_dir=ppl_dump_dir,
+                max_tokens_per_file=1000000,
+                dump_interval=5.0
+            )
+            logger.info(f"PPL dump manager initialized with dump_dir={ppl_dump_dir}")
+        else:
+            self.ppl_dump_manager = None
+
     def _get_positions(self, num_tokens: int):
         if self.uses_mrope:
             return self.mrope_positions[:, :num_tokens]
@@ -286,6 +387,74 @@ class SpecDecodeBaseProposer:
 
         self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)
 
+    def get_token_top_ks_from_proposals(
+        self,
+        token_ids: torch.Tensor,
+        logits: torch.Tensor,
+        assisted_action_configs: list[str],
+    ) -> torch.Tensor:
+        """Get token top-k values from proposal probabilities.
+
+        Args:
+            proposals: SpeculativeProposals object containing proposal probabilities.
+        Returns:
+            A tensor of shape (batch_size, max_proposal_len) containing the top-k
+            values for each token in the proposals.
+        """
+        model_config = self.vllm_config.model_config
+        batch_size, spec_len = token_ids.shape
+        
+        base_top_k = model_config.get_num_experts_per_token()
+        target_model = self.runner.get_model()
+        assert is_mixture_of_experts(target_model), (
+            "The model must be a mixture of experts model.")
+        num_layers = target_model.num_moe_layers
+        assert num_layers > 0, "No MoE layers found in the model."
+
+        # Assert input tensors are on-device.
+        assert token_ids.device.type == self.device.type, (
+            f"Expected token_ids to be on device {self.device.type}, "
+            f"but got {token_ids.device.type}."
+        )
+        assert logits.device.type == self.device.type, (
+            f"Expected logits to be on device {self.device.type}, "
+            f"but got {logits.device.type}."
+        )
+
+        ppls = calc_perplexity(logits, token_ids)
+        
+        # Report PPLs to dump manager if enabled
+        if self.ppl_dump_manager is not None:
+            self.ppl_dump_manager.add_token_ppls(ppls)
+
+        total_topks = torch.full(
+            (num_layers, batch_size, spec_len+1),
+            base_top_k,
+            device=self.device,
+        )
+
+        assert len(assisted_action_configs) == batch_size, \
+            f"Expected {batch_size} assisted action configs, " \
+            f"but got {len(assisted_action_configs)}"
+
+        for req_idx, action_cfg in enumerate(assisted_action_configs):
+            action_cfg = UserDefinedFunctionConfig.loads(action_cfg)
+            if action_cfg is None:
+                continue
+            action = load_user_defined_function(action_cfg)
+            with torch.device(self.device):
+                spec_topks = action(ppls[req_idx], model_config.hf_config)
+                # The output token guides the top-k of the input token.
+                total_topks[:, req_idx, :-1] = spec_topks
+                # The last token's top-k is determined by the mean k.
+                if envs.VLLM_DYN_TOPK_APPLY_LAST_TOKEN:
+                    last_topks = torch.mean(spec_topks, dim=-1, dtype=torch.float32)
+                    total_topks[:, req_idx, -1] = last_topks
+
+        # Swap num_layers to inner dim for better input organization.
+        total_topks = total_topks.permute(1, 2, 0).contiguous()
+        return total_topks
+
     def propose(
         self,
         # [num_tokens]
@@ -304,7 +473,7 @@ class SpecDecodeBaseProposer:
         slot_mappings: dict[str, torch.Tensor]
         | list[dict[str, torch.Tensor]]
         | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size = common_attn_metadata.batch_size()
 
         if self.method == "eagle3":
@@ -417,7 +586,7 @@ class SpecDecodeBaseProposer:
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
             draft_token_ids = logits.argmax(dim=-1)
-            return draft_token_ids.view(-1, 1)
+            return draft_token_ids.view(-1, 1), logits
 
         if self.uses_mrope:
             positions = self.mrope_positions[:, last_token_indices]
@@ -434,6 +603,7 @@ class SpecDecodeBaseProposer:
             hidden_states = hidden_states[last_token_indices]
 
         if isinstance(attn_metadata, TreeAttentionMetadata):
+            assert False, "Tree Attention is not supported for top_ks."
             # Draft using tree attention.
             draft_token_ids_list = self.propose_tree(
                 batch_size=batch_size,
@@ -444,7 +614,7 @@ class SpecDecodeBaseProposer:
                 slot_mappings=slot_mappings,
             )
             # [batch_size, num_tree_tokens]
-            return torch.cat(draft_token_ids_list, dim=1)
+            return torch.cat(draft_token_ids_list, dim=1), logits
 
         draft_token_ids = logits.argmax(dim=-1)
 
@@ -460,6 +630,7 @@ class SpecDecodeBaseProposer:
 
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
+        draft_token_logits_list = [logits]
 
         batch_size_dp_padded, batch_size_across_dp = self._pad_batch_across_dp(
             num_tokens_unpadded=batch_size, num_tokens_padded=batch_size
@@ -614,10 +785,13 @@ class SpecDecodeBaseProposer:
             logits = self.model.compute_logits(last_hidden_states[:batch_size])
             draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_list.append(draft_token_ids)
+            draft_token_logits_list.append(logits)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
-        return draft_token_ids
+        # [batch_size, num_speculative_tokens, vocab_size]
+        draft_token_logits = torch.stack(draft_token_logits_list, dim=1)
+        return draft_token_ids, draft_token_logits
 
     def set_inputs_first_pass(
         self,
@@ -1440,6 +1614,14 @@ class EagleProposer(SpecDecodeBaseProposer):
             pass_hidden_states_to_model=True,
             runner=runner,
         )
+
+    def __del__(self):
+        """Cleanup on deletion."""
+        if hasattr(self, 'ppl_dump_manager') and self.ppl_dump_manager is not None:
+            try:
+                self.ppl_dump_manager.shutdown()
+            except Exception:
+                pass
 
 
 # NOTE(woosuk): Currently, the below code is not used and we always use argmax
