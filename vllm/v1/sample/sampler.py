@@ -124,6 +124,7 @@ class Sampler(nn.Module):
             # [num_requests, 1], where each row represents one generated
             # token per request.
             sampled_token_ids=sampled.unsqueeze(-1),
+            sampled_token_top_ks=None,
             logprobs_tensors=logprobs_tensors,
         )
         return sampler_output

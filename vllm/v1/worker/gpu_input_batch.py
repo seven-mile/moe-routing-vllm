@@ -123,6 +123,7 @@ class InputBatch:
             (max_num_reqs, max_model_len), device="cpu", dtype=bool, pin_memory=False
         )
         self.is_token_ids = self.is_token_ids_tensor.numpy()
+        self.token_top_ks_cpu_tensor: torch.Tensor | None = None
         # Store prompt embeddings per request to avoid OOM from large upfront
         # allocation if max_model_len is big.
         # Maps req_index -> tensor of shape (num_prompt_tokens, hidden_size)
@@ -281,11 +282,26 @@ class InputBatch:
         self.sampled_token_ids_cpu: torch.Tensor | None = None
         self.async_copy_ready_event: torch.Event | None = None
 
+    def initialize_token_top_ks(self, num_moe_layers: int, base_top_k: int):
+        self.token_top_ks_cpu_tensor = torch.full(
+            (self.max_num_reqs, self.max_model_len, num_moe_layers),
+            base_top_k,
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=False,
+        )
+
     @property
     def req_ids(self) -> list[str]:
         # None elements should only be present transiently
         # while performing state updates to the batch.
         return cast(list[str], self._req_ids)
+    
+    @property
+    def token_top_ks_cpu(self) -> np.ndarray:
+        if self.token_top_ks_cpu_tensor is None:
+            raise ValueError("token_top_ks_cpu_tensor is not initialized.")
+        return self.token_top_ks_cpu_tensor.numpy()
 
     def _register_add_request(self, request: "CachedRequestState") -> int:
         """Track add-request operations for logits processors.
@@ -453,7 +469,9 @@ class InputBatch:
         return req_index
 
     def update_req_spec_token_ids(
-        self, request: CachedRequestState, scheduled_spec_tokens: dict[str, list[int]]
+        self, request: CachedRequestState,
+        scheduled_spec_tokens: dict[str, list[int]],
+        scheduled_spec_token_top_ks: dict[str, list[list[int]]],
     ) -> None:
         req_id = request.req_id
         req_index = self.req_id_to_index[req_id]
@@ -465,6 +483,7 @@ class InputBatch:
         # even when speculative decoding is enabled.
         cur_spec_token_ids.clear()
         spec_token_ids = scheduled_spec_tokens.get(req_id, ())
+        spec_token_top_ks = (scheduled_spec_token_top_ks.get(req_id, ()))
         num_spec_tokens = len(spec_token_ids)
         request.prev_num_draft_len = num_spec_tokens
         if not spec_token_ids:
@@ -476,6 +495,10 @@ class InputBatch:
         start_index = self.num_tokens_no_spec[req_index]
         end_token_index = start_index + num_spec_tokens
         self.token_ids_cpu[req_index, start_index:end_token_index] = spec_token_ids
+        # NOTE(seven-mile): token topks is 1+gamma, the first k assists
+        # the last one of non-spec tokens.
+        self.token_top_ks_cpu[
+            req_index, start_index-1:end_token_index] = spec_token_top_ks
         cur_spec_token_ids.extend(spec_token_ids)
 
     def remove_request(self, req_id: str) -> int | None:

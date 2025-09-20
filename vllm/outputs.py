@@ -26,6 +26,7 @@ class CompletionOutput:
         index: The index of the output in the request.
         text: The generated output text.
         token_ids: The token IDs of the generated output text.
+        token_top_ks: The layerwise top-k token ids at each position of the generated output text.
         cumulative_logprob: The cumulative log probability of the generated
             output text.
         logprobs: The log probabilities of the top probability words at each
@@ -40,6 +41,7 @@ class CompletionOutput:
     index: int
     text: str
     token_ids: GenericSequence[int]
+    token_top_ks: GenericSequence[GenericSequence[int]]
     cumulative_logprob: float | None
     logprobs: SampleLogprobs | None
     routed_experts: np.ndarray | None = None  # [seq_len,layer_num,topk]
@@ -55,6 +57,7 @@ class CompletionOutput:
             f"CompletionOutput(index={self.index}, "
             f"text={self.text!r}, "
             f"token_ids={self.token_ids}, "
+            f"token_top_ks={self.token_top_ks}, "
             f"routed_experts={self.routed_experts}, "
             f"cumulative_logprob={self.cumulative_logprob}, "
             f"logprobs={self.logprobs}, "

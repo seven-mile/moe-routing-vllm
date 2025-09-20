@@ -33,6 +33,7 @@ def create_fused_moe_router(
     # common parameters
     top_k: int,
     global_num_experts: int,
+    layer_idx: int,
     renormalize: bool = True,
     indices_type_getter: Callable[[], torch.dtype | None] | None = None,
     # grouped topk parameters
@@ -101,6 +102,8 @@ def create_fused_moe_router(
         )
 
     if use_grouped_topk:
+        raise NotImplementedError(
+            "token_top_ks with grouped_topk is not supported yet.")
         assert custom_routing_function is None
         if num_expert_group is None or topk_group is None:
             raise ValueError(
@@ -135,6 +138,9 @@ def create_fused_moe_router(
         topk_group = None
 
     if custom_routing_function is not None:
+        raise NotImplementedError(
+            "token_top_ks with custom routing function is not "
+            "supported yet.")
         return CustomRoutingRouter(
             top_k=top_k,
             global_num_experts=global_num_experts,
@@ -146,6 +152,8 @@ def create_fused_moe_router(
         )
 
     if e_score_correction_bias is not None:
+        raise NotImplementedError(
+            "token_top_ks with fused topk bias router is not supported yet.")
         return FusedTopKBiasRouter(
             top_k=top_k,
             global_num_experts=global_num_experts,
@@ -158,10 +166,14 @@ def create_fused_moe_router(
             indices_type_getter=indices_type_getter,
         )
 
+    if not renormalize:
+        raise ValueError(
+            "renormalize must be True when using default routing.")
     return FusedTopKRouter(
         top_k=top_k,
         global_num_experts=global_num_experts,
         eplb_state=eplb_state,
+        layer_idx=layer_idx,
         renormalize=renormalize,
         scoring_func=scoring_func,
         enable_eplb=enable_eplb,

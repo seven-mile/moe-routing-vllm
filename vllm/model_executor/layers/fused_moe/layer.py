@@ -328,6 +328,8 @@ class FusedMoE(CustomOp):
         compilation_config.static_forward_context[prefix] = self
         compilation_config.static_all_moe_layers.append(prefix)
         self.layer_name = prefix
+        from vllm.model_executor.models.utils import extract_layer_index
+        self.layer_idx = extract_layer_index(prefix)
 
         self.enable_eplb = enable_eplb
         # TODO(bnell): should this be owned by router?
@@ -449,6 +451,7 @@ class FusedMoE(CustomOp):
             top_k=top_k,
             global_num_experts=self.global_num_experts,
             eplb_state=self.eplb_state,
+            layer_idx=self.layer_idx,
             renormalize=renormalize,
             use_grouped_topk=use_grouped_topk,
             num_expert_group=num_expert_group,

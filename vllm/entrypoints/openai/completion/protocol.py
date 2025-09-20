@@ -13,6 +13,7 @@ from vllm.config import ModelConfig
 from vllm.config.utils import replace
 from vllm.entrypoints.openai.engine.protocol import (
     AnyResponseFormat,
+    DynAssistedActionConfig,
     LegacyStructuralTagResponseFormat,
     OpenAIBaseModel,
     StreamOptions,
@@ -81,6 +82,7 @@ class CompletionRequest(OpenAIBaseModel):
     truncate_prompt_tokens: Annotated[int, Field(ge=-1, le=_INT64_MAX)] | None = None
     allowed_token_ids: list[int] | None = None
     prompt_logprobs: int | None = None
+    dyn_assisted_action_config: DynAssistedActionConfig | None = None
     # --8<-- [end:completion-sampling-params]
 
     # --8<-- [start:completion-extra-params]
@@ -310,6 +312,10 @@ class CompletionRequest(OpenAIBaseModel):
             max_tokens=max_tokens if not echo_without_generation else 1,
             min_tokens=self.min_tokens,
             prompt_logprobs=prompt_logprobs,
+            dyn_assisted_action_config=(
+                self.dyn_assisted_action_config.to_udf()
+                if self.dyn_assisted_action_config else None
+            ),
             skip_special_tokens=self.skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             include_stop_str_in_output=self.include_stop_str_in_output,
@@ -466,6 +472,7 @@ class CompletionResponseChoice(OpenAIBaseModel):
         ),
     )
     token_ids: list[int] | None = None  # For response
+    token_top_ks: list[list[int]] | None = None
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
     prompt_token_ids: list[int] | None = None  # For prompt
 
@@ -503,6 +510,7 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
     # prompt tokens is put into choice to align with CompletionResponseChoice
     prompt_token_ids: list[int] | None = None
     token_ids: list[int] | None = None
+    token_top_ks: list[list[int]] | None = None
 
 
 class CompletionStreamResponse(OpenAIBaseModel):

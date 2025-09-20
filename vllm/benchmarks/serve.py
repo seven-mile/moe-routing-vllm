@@ -199,6 +199,11 @@ class BenchmarkMetrics:
     # Max output tokens per second and concurrent requests at that peak
     max_output_tokens_per_s: float
     max_concurrent_requests: int
+    # Top-k related.
+    mean_token_top_k: float
+    median_token_top_k: float
+    std_token_top_k: float
+    percentiles_token_top_k: list[tuple[float, float]]
     rtfx: float = 0.0  # Inverse Real-Time Factor for ASR benchmarks
 
 
@@ -420,6 +425,7 @@ def calculate_metrics(
     ttfts: list[float] = []
     e2els: list[float] = []
     input_audio_duration = 0.0
+    top_ks: list[float] = []
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_tokens
@@ -451,6 +457,8 @@ def calculate_metrics(
             ttfts.append(outputs[i].ttft)
             e2els.append(outputs[i].latency)
             input_audio_duration += outputs[i].input_audio_duration
+            if outputs[i].avg_token_top_k is not None:
+                top_ks.append(outputs[i].avg_token_top_k)
             completed += 1
         else:
             actual_output_lens.append(0)
@@ -596,6 +604,11 @@ def calculate_metrics(
         max_output_tokens_per_s=max_output_tokens_per_s,
         max_concurrent_requests=max_concurrent_requests,
         rtfx=input_audio_duration / dur_s,
+        mean_token_top_k=np.mean(top_ks or 0),
+        median_token_top_k=np.median(top_ks or 0),
+        std_token_top_k=np.std(top_ks or 0),
+        percentiles_token_top_k=[(p, np.percentile(top_ks or 0, p))
+                                 for p in selected_percentiles],
     )
 
     return metrics, actual_output_lens
@@ -781,6 +794,7 @@ async def benchmark(
 
     print(f"Burstiness factor: {burstiness} ({distribution})")
     print(f"Maximum request concurrency: {max_concurrency}")
+    print(f"Dynamic Assisted Action config: {extra_body.get('dyn_assisted_action_config')}")
 
     spec_decode_metrics_before = await fetch_spec_decode_metrics(base_url, session)
 
@@ -996,6 +1010,10 @@ async def benchmark(
             "itls": [output.itl for output in outputs],
             "start_times": [output.start_time for output in outputs],
             "generated_texts": [output.generated_text for output in outputs],
+            "generated_token_top_ks_list": [
+                output.generated_token_top_ks for output in outputs
+            ],
+            "avg_token_top_ks_list": [output.avg_token_top_k for output in outputs],
             "errors": [output.error for output in outputs],
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
@@ -1071,6 +1089,25 @@ async def benchmark(
         process_one_metric("tpot", "TPOT", "Time per Output Token (excl. 1st token)")
         process_one_metric("itl", "ITL", "Inter-token Latency")
     process_one_metric("e2el", "E2EL", "End-to-end Latency")
+    # Topk related. (not ms)
+    print("{s:{c}^{n}}".format(s="Token Top-K", n=50, c='-'))
+    print("{:<40} {:<10.2f}".format(
+        f"Mean Token Top-K :",
+        metrics.mean_token_top_k))
+    print("{:<40} {:<10.2f}".format(
+        f"Median Token Top-K :",
+        metrics.median_token_top_k))
+    print("{:<40} {:<10.2f}".format(
+        f"Std Token Top-K :",
+        metrics.std_token_top_k))
+    result["mean_token_top_k"] = metrics.mean_token_top_k
+    result["median_token_top_k"] = metrics.median_token_top_k
+    result["std_token_top_k"] = metrics.std_token_top_k
+    for p, value in metrics.percentiles_token_top_k:
+        p_word = str(int(p)) if int(p) == p else str(p)
+        print("{:<40} {:<10.2f}".format(f"P{p_word} Token Top-K :",
+                                        value))
+        result[f"p{p_word}_token_top_k"] = value
 
     if spec_decode_stats is not None:
         print("{s:{c}^{n}}".format(s="Speculative Decoding", n=50, c="-"))
@@ -1180,7 +1217,7 @@ def save_to_pytorch_benchmark_format(
     ]
     # These raw data might be useful, but they are rather big. They can be added
     # later if needed
-    ignored_metrics = ["ttfts", "itls", "generated_texts", "errors"]
+    ignored_metrics = ["ttfts", "itls", "generated_texts", "generated_token_top_ks_list", "errors"]
     pt_records = convert_to_pytorch_benchmark_format(
         args=args,
         metrics={k: [results[k]] for k in metrics if k in results},
@@ -1626,6 +1663,12 @@ def add_cli_args(parser: argparse.ArgumentParser):
         help="Generate a matplotlib figure with dataset statistics showing "
         "prompt tokens, output tokens, and combined token distributions.",
     )
+    parser.add_argument(
+        "--dyn-assisted-action-config",
+        type=str,
+        default="null",
+        help="JSON string that specifies the config for dynamic assistance."
+    )
 
 
 def main(args: argparse.Namespace) -> dict[str, Any]:
@@ -1748,6 +1791,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
 
     # Collect the sampling parameters.
     if task_type == TaskType.GENERATION:
+        dyn_assisted_action_config = json.loads(args.dyn_assisted_action_config)
         sampling_params = {
             k: v
             for k, v in {
@@ -1758,6 +1802,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                 "frequency_penalty": args.frequency_penalty,
                 "presence_penalty": args.presence_penalty,
                 "repetition_penalty": args.repetition_penalty,
+                "dyn_assisted_action_config": dyn_assisted_action_config,
             }.items()
             if v is not None
         }
@@ -1948,6 +1993,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             "ttfts",
             "itls",
             "generated_texts",
+            "generated_token_top_ks_list",
             "errors",
         ]:
             if field in result_json:

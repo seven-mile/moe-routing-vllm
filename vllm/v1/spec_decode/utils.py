@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
+import torch.nn.functional as F
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -472,3 +473,11 @@ def update_num_computed_tokens_for_batch_change(
     num_accepted_tokens.copy_(
         torch.where(participating, valid_counts, num_accepted_tokens)
     )
+
+def calc_perplexity(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+    logits = logits.float()
+    assert logits.shape[:-1] == token_ids.shape, \
+        f"Logits shape {logits.shape} does not match token_ids shape {token_ids.shape}"
+    loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), token_ids.reshape(-1), reduction='none')
+    perplexity = torch.exp(loss)
+    return perplexity.view(token_ids.shape)
