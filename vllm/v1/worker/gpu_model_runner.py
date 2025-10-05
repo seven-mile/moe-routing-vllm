@@ -442,6 +442,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Cached outputs.
         self._draft_token_ids: Optional[Union[list[list[int]],
                                               torch.Tensor]] = None
+        self._draft_token_top_ks: Optional[torch.Tensor] = None
         self.transfer_event = torch.cuda.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_model_len, 1),
@@ -711,16 +712,21 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self.input_batch.num_tokens_no_spec[
                     req_index] = end_token_index
                 self.input_batch.num_tokens[req_index] = end_token_index
+                assert False, "PP support for token_top_ks NYI"
 
             # Add spec_token_ids to token_ids_cpu.
             spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
+            spec_token_top_ks = (scheduler_output
+                .scheduled_spec_decode_token_top_ks.get(req_id, []))
             if spec_token_ids:
                 num_spec_tokens = len(spec_token_ids)
                 start_index = self.input_batch.num_tokens_no_spec[req_index]
                 end_token_index = start_index + num_spec_tokens
                 self.input_batch.token_ids_cpu[
                     req_index, start_index:end_token_index] = spec_token_ids
+                self.input_batch.token_top_ks_cpu[
+                    req_index, start_index:end_token_index] = spec_token_top_ks
                 # NOTE(woosuk): `num_tokens` here may include spec tokens.
                 self.input_batch.num_tokens[req_index] += num_spec_tokens
 
@@ -877,6 +883,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
                 self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
             return
+    
+        assert False, "Async scheduling top_ks NYI"
 
         # Async scheduling case, where some decode requests from the previous
         # iteration won't have entries in input_ids_cpu and need to be copied
@@ -2400,6 +2408,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+        # TODO: Set token_top_ks here.
+        # print(f'Z model run {self.input_batch.token_top_ks_cpu.tolist()=}', flush=True)
         with (set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -2485,7 +2495,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("Draft"):
-                self._draft_token_ids = self.propose_draft_token_ids(
+                self._draft_token_ids, self._draft_token_top_ks = self.propose_draft_token_ids(
                     scheduler_output,
                     sampled_token_ids,
                     self.input_batch.sampling_metadata,
@@ -2569,7 +2579,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             draft_token_ids = self._draft_token_ids
         self._draft_token_ids = None
-        return DraftTokenIds(req_ids, draft_token_ids)
+        draft_token_top_ks = self._draft_token_top_ks.tolist()
+        self._draft_token_top_ks = None
+        return DraftTokenIds(req_ids, draft_token_ids, draft_token_top_ks)
 
     def propose_draft_token_ids(
         self,
@@ -2581,8 +2593,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         aux_hidden_states: Optional[list[torch.Tensor]],
         spec_decode_metadata: Optional[SpecDecodeMetadata],
         common_attn_metadata: CommonAttentionMetadata,
-    ) -> Union[list[list[int]], torch.Tensor]:
+    ) -> tuple[Union[list[list[int]], torch.Tensor], Optional[torch.Tensor]]:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        draft_token_top_ks = None
         if self.speculative_config.method == "ngram":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, NgramProposer)
@@ -2690,7 +2703,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 mm_embed_inputs = None
 
-            draft_token_ids = self.drafter.propose(
+            draft_token_ids, draft_token_logits = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
@@ -2701,7 +2714,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 mm_embed_inputs=mm_embed_inputs,
             )
 
-        return draft_token_ids
+            draft_token_top_ks = self.drafter.get_token_top_ks_from_proposals(
+                draft_token_ids, draft_token_logits)
+
+        return draft_token_ids, draft_token_top_ks
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         allowed_config_names = {"load_config", "model_config"}

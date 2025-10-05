@@ -119,6 +119,15 @@ class InputBatch:
                                         device="cpu",
                                         dtype=bool,
                                         pin_memory=False)
+        # token_top_ks
+        self.token_top_ks_cpu_tensor = torch.full(
+            (max_num_reqs, max_model_len),
+            8, # FIXME: Use base_top_k rather than the hard-coded value.
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=False,
+        )
+        self.token_top_ks_cpu = self.token_top_ks_cpu_tensor.numpy()
         # Store prompt embeddings per request to avoid OOM from large upfront
         # allocation if max_model_len is big.
         # Maps req_index -> tensor of shape (num_prompt_tokens, hidden_size)

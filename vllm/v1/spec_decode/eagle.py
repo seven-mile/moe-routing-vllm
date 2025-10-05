@@ -5,6 +5,8 @@ from dataclasses import replace
 from importlib.util import find_spec
 from typing import Optional
 
+import functools
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -31,6 +33,7 @@ from vllm.v1.attention.backends.utils import (AttentionMetadataBuilder,
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.utils import calc_perplexity, load_action_from_config
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
@@ -175,6 +178,42 @@ class EagleProposer:
         else:
             self.positions[:num_tokens] = positions
 
+    @functools.lru_cache(maxsize=None)
+    def _get_assisted_action(self, config):
+        action = load_action_from_config(config)
+        return action
+
+    def get_token_top_ks_from_proposals(
+        self,
+        token_ids: torch.Tensor,
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Get token top-k values from proposal probabilities.
+
+        Args:
+            proposals: SpeculativeProposals object containing proposal probabilities.
+        Returns:
+            A tensor of shape (batch_size, max_proposal_len) containing the top-k
+            values for each token in the proposals.
+        """
+        model_config = self.vllm_config.model_config
+        batch_size, spec_len = token_ids.shape
+        
+        base_top_k = model_config.get_num_experts_per_token()
+        num_layers = model_config.get_num_layers(
+            self.vllm_config.parallel_config)
+
+        ppls = calc_perplexity(logits, token_ids)
+
+        total_topks = torch.full((num_layers, batch_size, spec_len+1), base_top_k)
+        assisted_action = self._get_assisted_action(
+            "configs/ppl_to_ks.py:spec_default1_mask2025")
+        spec_topks = assisted_action(ppls, model_config.hf_config)
+        # The output token guides the top-k of the input token.
+        total_topks[:, :, -spec_len-1:-1] = spec_topks
+        # TODO: Layerwise topks.
+        return total_topks[0]
+
     def propose(
         self,
         # [num_tokens]
@@ -190,7 +229,7 @@ class EagleProposer:
         sampling_metadata: SamplingMetadata,
         mm_embed_inputs: Optional[tuple[list[torch.Tensor],
                                         torch.Tensor]] = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         num_tokens = target_token_ids.shape[0]
         batch_size = next_token_ids.shape[0]
 
@@ -279,7 +318,7 @@ class EagleProposer:
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
             draft_token_ids = logits.argmax(dim=-1)
-            return draft_token_ids.view(-1, 1)
+            return draft_token_ids.view(-1, 1), logits
 
         if self.uses_mrope:
             positions = target_positions[:, last_token_indices]
@@ -291,6 +330,7 @@ class EagleProposer:
             hidden_states = hidden_states[last_token_indices]
 
         if isinstance(attn_metadata, TreeAttentionMetadata):
+            assert False, "Tree Attention is not supported for top_ks."
             # Draft using tree attention.
             draft_token_ids_list = self.propose_tree(
                 batch_size=batch_size,
@@ -300,7 +340,7 @@ class EagleProposer:
                 common_attn_metadata=common_attn_metadata,
             )
             # [batch_size, num_tree_tokens]
-            return torch.cat(draft_token_ids_list, dim=1)
+            return torch.cat(draft_token_ids_list, dim=1), logits
 
         draft_token_ids = logits.argmax(dim=-1)
 
@@ -314,6 +354,7 @@ class EagleProposer:
 
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
+        draft_token_logits_list = [logits]
 
         if self.use_cuda_graph and \
                 batch_size <= self.cudagraph_batch_sizes[-1]:
@@ -428,10 +469,13 @@ class EagleProposer:
             logits = self.model.compute_logits(last_hidden_states[:batch_size])
             draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_list.append(draft_token_ids)
+            draft_token_logits_list.append(logits)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
-        return draft_token_ids
+        # [batch_size, num_speculative_tokens, vocab_size]
+        draft_token_logits = torch.stack(draft_token_logits_list, dim=1)
+        return draft_token_ids, draft_token_logits
 
     def prepare_next_token_ids_cpu(
             self, sampled_token_ids: list[list[int]],

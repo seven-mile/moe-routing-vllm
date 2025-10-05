@@ -202,6 +202,7 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        scheduled_spec_decode_token_top_ks: dict[str, list[int]] = {}
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -312,6 +313,9 @@ class Scheduler(SchedulerInterface):
                     del request.spec_token_ids[num_scheduled_spec_tokens:]
                     scheduled_spec_decode_tokens[request.request_id] = (
                         request.spec_token_ids)
+                    del request.spec_token_top_ks[num_scheduled_spec_tokens:]
+                    scheduled_spec_decode_token_top_ks[request.request_id] = (
+                        request.spec_token_top_ks)
 
             # Encoder-related.
             if encoder_inputs_to_schedule:
@@ -588,6 +592,8 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            scheduled_spec_decode_token_top_ks=(
+                scheduled_spec_decode_token_top_ks),
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
             # finished_req_ids is an existing state in the scheduler,
@@ -1086,9 +1092,10 @@ class Scheduler(SchedulerInterface):
         self,
         draft_token_ids: DraftTokenIds,
     ) -> None:
-        for req_id, spec_token_ids in zip(
+        for req_id, spec_token_ids, spec_token_top_ks in zip(
                 draft_token_ids.req_ids,
                 draft_token_ids.draft_token_ids,
+                draft_token_ids.draft_token_top_ks,
         ):
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
@@ -1105,6 +1112,7 @@ class Scheduler(SchedulerInterface):
                     spec_token_ids)
             else:
                 request.spec_token_ids = spec_token_ids
+            request.spec_token_top_ks = spec_token_top_ks[:len(request.spec_token_ids)]
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
