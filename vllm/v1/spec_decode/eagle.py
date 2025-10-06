@@ -18,7 +18,8 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
-from vllm.model_executor.models import supports_multimodal
+from vllm.model_executor.models.interfaces import (supports_multimodal,
+                                                   is_mixture_of_experts)
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -200,8 +201,11 @@ class EagleProposer:
         batch_size, spec_len = token_ids.shape
         
         base_top_k = model_config.get_num_experts_per_token()
-        num_layers = model_config.get_num_layers(
-            self.vllm_config.parallel_config)
+        target_model = self.runner.model
+        assert is_mixture_of_experts(target_model), (
+            "The model must be a mixture of experts model.")
+        num_layers = target_model.num_moe_layers
+        assert num_layers > 0, "No MoE layers found in the model."
 
         ppls = calc_perplexity(logits, token_ids)
 
@@ -211,8 +215,10 @@ class EagleProposer:
         spec_topks = assisted_action(ppls, model_config.hf_config)
         # The output token guides the top-k of the input token.
         total_topks[:, :, -spec_len-1:-1] = spec_topks
-        # TODO: Layerwise topks.
-        return total_topks[0]
+
+        # Swap num_layers to inner dim for better input organization.
+        total_topks = total_topks.permute(1, 2, 0).contiguous()
+        return total_topks
 
     def propose(
         self,

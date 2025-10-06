@@ -202,7 +202,7 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
-        scheduled_spec_decode_token_top_ks: dict[str, list[int]] = {}
+        scheduled_spec_decode_token_top_ks: dict[str, list[list[int]]] = {}
 
         # For logging.
         scheduled_timestamp = time.monotonic()

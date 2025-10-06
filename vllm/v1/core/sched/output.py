@@ -144,7 +144,7 @@ class SchedulerOutput:
     scheduled_spec_decode_tokens: dict[str, list[int]]
     # req_id -> spec_token_top_k
     # Behave like scheduled_spec_decode_tokens, but for top_k values.
-    scheduled_spec_decode_token_top_ks: dict[str, list[int]]
+    scheduled_spec_decode_token_top_ks: dict[str, list[list[int]]]
     # req_id -> encoder input indices that need processing.
     # E.g., if a request has [0, 1], it could mean the vision encoder needs
     # to process that the request's 0-th and 1-th images in the current step.

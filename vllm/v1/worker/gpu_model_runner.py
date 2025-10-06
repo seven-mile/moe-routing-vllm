@@ -4,6 +4,7 @@
 import gc
 import itertools
 import time
+import warnings
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -347,8 +348,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Persistent buffers for CUDA graphs.
         self.input_ids = self._make_buffer(self.max_num_tokens,
                                            dtype=torch.int32)
-        self.input_top_ks = self._make_buffer(self.max_num_tokens,
-                                              dtype=torch.int32)
+        self._input_top_ks: Optional[CpuGpuBuffer] = None
         self.positions = self._make_buffer(self.max_num_tokens,
                                            dtype=torch.int64)
         self.query_start_loc = self._make_buffer(self.max_num_reqs + 1,
@@ -451,6 +451,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             dtype=torch.int64,
             device="cpu",
             pin_memory=self.pin_memory)
+
+    @property
+    def input_top_ks(self) -> CpuGpuBuffer:
+        assert self._input_top_ks is not None
+        return self._input_top_ks
 
     def _get_positions(self, num_tokens: Any):
         if isinstance(num_tokens, int):
@@ -1032,7 +1037,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                            token_indices_tensor,
                            out=self.input_ids.cpu[:total_num_scheduled_tokens])
         torch.index_select(
-            self.input_batch.token_top_ks_cpu_tensor.flatten(),
+            self.input_batch.token_top_ks_cpu_tensor.flatten(0, 1),
             0,
             token_indices_tensor,
             out=self.input_top_ks.cpu[:total_num_scheduled_tokens])
@@ -2424,7 +2429,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         assert input_top_ks is not None
-        assert input_top_ks.shape == input_ids.shape, (
+        assert input_top_ks.shape[:1] == input_ids.shape, (
             f"token_top_ks_cpu shape {input_top_ks.shape} should match input_ids shape {input_ids.shape}")
         with (set_forward_context(
                 attn_metadata,
@@ -3914,6 +3919,22 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     if self.vllm_config.speculative_config else 0),
             )
 
+    def _reinitialize_token_top_ks_buffer(self) -> None:
+        """
+        Re-initialize the token_top_ks buffer after loading the model.
+        """
+        if not is_mixture_of_experts(self.model):
+            warnings.warn(
+                "Reinitializing token_top_ks buffer for a non-MoE model.")
+            return
+        num_moe_layers = self.model.num_moe_layers
+        base_top_k = self.model_config.get_num_experts_per_token()
+        self.input_batch.initialize_token_top_ks(num_moe_layers, base_top_k)
+        
+        self._input_top_ks = self._make_buffer(self.max_num_tokens,
+                                               num_moe_layers,
+                                               dtype=torch.int32)
+
     def _allocate_kv_cache_tensors(
             self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         """
@@ -4140,6 +4161,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self.may_reinitialize_input_batch(kv_cache_config)
+        self._reinitialize_token_top_ks_buffer()
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config)

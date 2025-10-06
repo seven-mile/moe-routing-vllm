@@ -120,14 +120,8 @@ class InputBatch:
                                         dtype=bool,
                                         pin_memory=False)
         # token_top_ks
-        self.token_top_ks_cpu_tensor = torch.full(
-            (max_num_reqs, max_model_len),
-            8, # FIXME: Use base_top_k rather than the hard-coded value.
-            device="cpu",
-            dtype=torch.int32,
-            pin_memory=False,
-        )
-        self.token_top_ks_cpu = self.token_top_ks_cpu_tensor.numpy()
+        self.token_top_ks_cpu_tensor: Optional[torch.Tensor] = None
+
         # Store prompt embeddings per request to avoid OOM from large upfront
         # allocation if max_model_len is big.
         # Maps req_index -> tensor of shape (num_prompt_tokens, hidden_size)
@@ -289,11 +283,26 @@ class InputBatch:
         self.prev_sampled_token_ids_invalid_indices: Optional[set[int]] = None
         self.prev_req_id_to_index: Optional[dict[str, int]] = None
 
+    def initialize_token_top_ks(self, num_moe_layers: int, base_top_k: int):
+        self.token_top_ks_cpu_tensor = torch.full(
+            (self.max_num_reqs, self.max_model_len, num_moe_layers),
+            base_top_k,
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=False,
+        )
+
     @property
     def req_ids(self) -> list[str]:
         # None elements should only be present transiently
         # while performing state updates to the batch.
         return cast(list[str], self._req_ids)
+    
+    @property
+    def token_top_ks_cpu(self) -> np.ndarray:
+        if self.token_top_ks_cpu_tensor is None:
+            raise ValueError("token_top_ks_cpu_tensor is not initialized.")
+        return self.token_top_ks_cpu_tensor.numpy()
 
     def _register_add_request(self, request: "CachedRequestState") -> int:
         """Track add-request operations for logits processors.
