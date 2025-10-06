@@ -553,6 +553,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         zero_expert_num = getattr(layer, 'zero_expert_num', 0)
         zero_expert_type = getattr(layer, 'zero_expert_type', None)
+        layer_idx = getattr(layer, 'layer_idx', None)
+        assert layer_idx is not None, \
+            "layer_idx must be set for fused moe layer"
 
         topk_weights, topk_ids, zero_expert_result = FusedMoE.select_experts(
             hidden_states=x,
@@ -567,6 +570,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
             indices_type=self.topk_indices_dtype,
+            layer_idx=layer_idx,
             enable_eplb=enable_eplb,
             expert_map=expert_map,
             expert_load_view=expert_load_view,
@@ -1011,6 +1015,8 @@ class FusedMoE(CustomOp):
             raise ValueError("Duplicate layer name: {}".format(prefix))
         compilation_config.static_forward_context[prefix] = self
         self.layer_name = prefix
+        from vllm.model_executor.models.utils import extract_layer_index
+        self.layer_idx = extract_layer_index(prefix)
 
         self.enable_eplb = enable_eplb
         self.expert_load_view: Optional[torch.Tensor] = None
@@ -1701,6 +1707,7 @@ class FusedMoE(CustomOp):
         routed_scaling_factor: float = 1.0,
         e_score_correction_bias: Optional[torch.Tensor] = None,
         indices_type: Optional[torch.dtype] = None,
+        layer_idx: Optional[int] = None,
         enable_eplb: bool = False,
         expert_map: Optional[torch.Tensor] = None,
         expert_load_view: Optional[torch.Tensor] = None,
@@ -1754,6 +1761,7 @@ class FusedMoE(CustomOp):
             if indices_type is not None:
                 topk_ids = topk_ids.to(dtype=indices_type)
         elif e_score_correction_bias is not None:
+            assert False, "expert weights mask NYI"
             topk_weights, topk_ids = fused_topk_bias(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -1771,6 +1779,7 @@ class FusedMoE(CustomOp):
                 topk=top_k,
                 renormalize=renormalize,
                 indices_type=indices_type,
+                layer_idx=layer_idx,
             )
         else:
             assert False, "expert weights mask NYI"
