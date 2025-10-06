@@ -347,6 +347,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Persistent buffers for CUDA graphs.
         self.input_ids = self._make_buffer(self.max_num_tokens,
                                            dtype=torch.int32)
+        self.input_top_ks = self._make_buffer(self.max_num_tokens,
+                                              dtype=torch.int32)
         self.positions = self._make_buffer(self.max_num_tokens,
                                            dtype=torch.int64)
         self.query_start_loc = self._make_buffer(self.max_num_reqs + 1,
@@ -879,6 +881,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if self.input_batch.prev_sampled_token_ids is None:
             # Normal scheduling case
             self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+            self.input_top_ks.copy_to_gpu(total_num_scheduled_tokens)
             if self.enable_prompt_embeds:
                 self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
                 self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
@@ -1028,6 +1031,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                            0,
                            token_indices_tensor,
                            out=self.input_ids.cpu[:total_num_scheduled_tokens])
+        torch.index_select(
+            self.input_batch.token_top_ks_cpu_tensor.flatten(),
+            0,
+            token_indices_tensor,
+            out=self.input_top_ks.cpu[:total_num_scheduled_tokens])
         if self.enable_prompt_embeds:
             is_token_ids = self.input_batch.is_token_ids.flatten()
             torch.index_select(
@@ -2016,7 +2024,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         ubatch_slices: Optional[UBatchSlices] = None,
         num_tokens_after_padding: Optional[torch.Tensor] = None,
     ) -> tuple[int, int, Optional[torch.Tensor], Optional[torch.Tensor],
-               Optional[torch.Tensor], torch.Tensor,
+               Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor,
                Optional[IntermediateTensors], dict[str, Any]]:
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -2053,11 +2061,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 inputs_embeds_scheduled)
 
             input_ids = None
+            input_top_ks = None
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
             model_kwargs = {
                 **self._init_model_kwargs(num_scheduled_tokens),
                 **self._extract_mm_kwargs(scheduler_output),
             }
+            assert False, "token_top_ks NYI"
         elif self.enable_prompt_embeds and get_pp_group().is_first_rank:
             # Get the input embeddings for the tokens that are not input embeds,
             # then put them into the appropriate positions.
@@ -2084,12 +2094,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
             model_kwargs = self._init_model_kwargs(num_input_tokens)
             input_ids = None
+            input_top_ks = None
+            assert False, "token_top_ks NYI"
         else:
             # For text-only models, we use token ids as input.
             # While it is possible to use embeddings as input just like the
             # multimodal models, it is not desirable for performance since
             # then the embedding layer is not included in the CUDA graph.
             input_ids = self.input_ids.gpu[:num_input_tokens]
+            input_top_ks = self.input_top_ks.gpu[:num_input_tokens]
             inputs_embeds = None
             model_kwargs = self._init_model_kwargs(num_input_tokens)
         if self.uses_mrope:
@@ -2113,6 +2126,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_input_tokens,
             num_tokens_after_padding,
             input_ids,
+            input_top_ks,
             inputs_embeds,
             positions,
             intermediate_tensors,
@@ -2375,6 +2389,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_input_tokens,
                 num_tokens_across_dp,
                 input_ids,
+                input_top_ks,
                 inputs_embeds,
                 positions,
                 intermediate_tensors,
@@ -2408,8 +2423,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
-        # TODO: Set token_top_ks here.
-        # print(f'Z model run {self.input_batch.token_top_ks_cpu.tolist()=}', flush=True)
+        assert input_top_ks is not None
+        assert input_top_ks.shape == input_ids.shape, (
+            f"token_top_ks_cpu shape {input_top_ks.shape} should match input_ids shape {input_ids.shape}")
         with (set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -2418,6 +2434,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 batch_descriptor=batch_descriptor,
                 ubatch_slices=ubatch_slices,
+                token_top_ks=input_top_ks,
         ), record_function_or_nullcontext("Forward"),
               self.maybe_get_kv_connector_output(scheduler_output) as
               kv_connector_output):
@@ -2579,6 +2596,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             draft_token_ids = self._draft_token_ids
         self._draft_token_ids = None
+        assert self._draft_token_top_ks is not None
         draft_token_top_ks = self._draft_token_top_ks.tolist()
         self._draft_token_top_ks = None
         return DraftTokenIds(req_ids, draft_token_ids, draft_token_top_ks)

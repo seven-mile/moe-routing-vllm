@@ -963,12 +963,11 @@ def vllm_topk_softmax(topk_weights: torch.Tensor, topk_indices: torch.Tensor,
     token_top_ks = get_forward_context().token_top_ks
     if token_top_ks is not None:
         # TODO: Layerwise top-k not supported yet.
-        print(f"Z Applying token top-k {token_top_ks.tolist()=}")
         # Mask out the invalid top-k weights for each token.
-        assert token_top_ks.ndim == 2, "Layerwise not supported"
-        token_top_ks = token_top_ks.view(-1)
-        # print(f"Z {token_top_ks.shape=}, {topk_indices.shape=}")
-        assert token_top_ks.shape == topk_indices.shape[:-1], "token_top_ks shape mismatch"
+        assert token_top_ks.ndim == 1, "Layerwise not supported"
+        assert token_top_ks.shape == topk_indices.shape[:-1], (
+            f"token_top_ks shape mismatch: {token_top_ks.shape} vs {topk_indices.shape}"
+        )
         num_tokens, topk = topk_weights.shape
         topk_mask = torch.arange(topk, device=topk_weights.device) >= token_top_ks[:, None]
         topk_indices.masked_fill_(topk_mask, -1)
