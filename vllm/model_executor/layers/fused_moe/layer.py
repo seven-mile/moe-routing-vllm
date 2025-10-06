@@ -2059,6 +2059,7 @@ class FusedMoE(CustomOp):
             self.dp_size > 1
             and not self.moe_parallel_config.use_deepep_ht_kernels
             and not self.moe_config.use_flashinfer_cutlass_kernels)
+        assert not do_naive_dispatch_combine, "naive dispatch/combine not compatible with dynamic top-k"
 
         # If there are shared experts but we are not using a modular kernel, the
         # shared experts must be called here
