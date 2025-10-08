@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
+import os
 from dataclasses import replace
 from importlib.util import find_spec
 from typing import Optional
@@ -210,8 +211,9 @@ class EagleProposer:
         ppls = calc_perplexity(logits, token_ids)
 
         total_topks = torch.full((num_layers, batch_size, spec_len+1), base_top_k)
+        
         assisted_action = self._get_assisted_action(
-            "configs/ppl_to_ks.py:spec_default1_mask2025")
+            os.environ["VLLM_SPEC_TOPK_ACTION_CONFIG"])
         spec_topks = assisted_action(ppls, model_config.hf_config)
         # The output token guides the top-k of the input token.
         total_topks[:, :, -spec_len-1:-1] = spec_topks
