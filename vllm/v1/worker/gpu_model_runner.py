@@ -2737,8 +2737,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 mm_embed_inputs=mm_embed_inputs,
             )
 
+            formulas = scheduler_output.scheduled_dyn_token_top_k_formulas
+            formulas = [formulas[req_id] for req_id in self.input_batch.req_ids]
+
             draft_token_top_ks = self.drafter.get_token_top_ks_from_proposals(
-                draft_token_ids, draft_token_logits)
+                draft_token_ids, draft_token_logits, formulas)
 
         return draft_token_ids, draft_token_top_ks
 

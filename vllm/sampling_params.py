@@ -201,6 +201,8 @@ class SamplingParams(
     allowed_token_ids: Optional[list[int]] = None
     """If provided, the engine will construct a logits processor which only
     retains scores for the given token ids."""
+    dyn_topk_formula: Optional[str] = None
+    """Control the ppl_to_k formula for the request."""
     extra_args: Optional[dict[str, Any]] = None
     """Arbitrary additional args, that can be used by custom sampling
     implementations, plugins, etc. Not used by any in-tree sampling
@@ -246,6 +248,7 @@ class SamplingParams(
         guided_decoding: Optional[GuidedDecodingParams] = None,
         logit_bias: Optional[Union[dict[int, float], dict[str, float]]] = None,
         allowed_token_ids: Optional[list[int]] = None,
+        dyn_topk_formula: Optional[str] = None,
         extra_args: Optional[dict[str, Any]] = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
@@ -297,6 +300,7 @@ class SamplingParams(
             structured_outputs=structured_outputs,
             logit_bias=logit_bias,
             allowed_token_ids=allowed_token_ids,
+            dyn_topk_formula=dyn_topk_formula,
             extra_args=extra_args,
         )
 
@@ -451,6 +455,15 @@ class SamplingParams(
         if self.best_of != self._real_n and self.output_kind == (
                 RequestOutputKind.DELTA):
             raise ValueError("best_of must equal n to use output_kind=DELTA")
+        
+        from vllm.v1.spec_decode.utils import load_action_from_config
+        if self.dyn_topk_formula:
+            try:
+                load_action_from_config(self.dyn_topk_formula)
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to load dyn_topk_formula from "
+                    f"{self.dyn_topk_formula}: {e}") from e
 
     def _verify_greedy_sampling(self) -> None:
         if self.n > 1:

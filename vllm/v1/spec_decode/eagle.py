@@ -180,7 +180,6 @@ class EagleProposer:
         else:
             self.positions[:num_tokens] = positions
 
-    @functools.lru_cache(maxsize=None)
     def _get_assisted_action(self, config):
         action = load_action_from_config(config)
         return action
@@ -189,6 +188,7 @@ class EagleProposer:
         self,
         token_ids: torch.Tensor,
         logits: torch.Tensor,
+        assisted_action_configs: list[Optional[str]],
     ) -> torch.Tensor:
         """Get token top-k values from proposal probabilities.
 
@@ -211,12 +211,18 @@ class EagleProposer:
         ppls = calc_perplexity(logits, token_ids)
 
         total_topks = torch.full((num_layers, batch_size, spec_len+1), base_top_k)
+
+        assert len(assisted_action_configs) == batch_size, \
+            f"Expected {batch_size} assisted action configs, " \
+            f"but got {len(assisted_action_configs)}"
         
-        assisted_action = self._get_assisted_action(
-            os.environ["VLLM_SPEC_TOPK_ACTION_CONFIG"])
-        spec_topks = assisted_action(ppls, model_config.hf_config)
-        # The output token guides the top-k of the input token.
-        total_topks[:, :, -spec_len-1:-1] = spec_topks
+        for req_idx, action_cfg in enumerate(assisted_action_configs):
+            if action_cfg is None or action_cfg.strip() == "":
+                continue
+            assisted_action = self._get_assisted_action(action_cfg)
+            spec_topks = assisted_action(ppls[req_idx], model_config.hf_config)
+            # The output token guides the top-k of the input token.
+            total_topks[:, req_idx, -spec_len-1:-1] = spec_topks
 
         # Swap num_layers to inner dim for better input organization.
         total_topks = total_topks.permute(1, 2, 0).contiguous()

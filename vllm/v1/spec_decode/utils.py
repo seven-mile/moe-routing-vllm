@@ -3,6 +3,8 @@
 import os
 import importlib.util
 
+import functools
+
 import torch
 import torch.nn.functional as F
 
@@ -28,6 +30,7 @@ def calc_perplexity(logits, token_ids):
     return perplexity.view(token_ids.shape)
 
 
+@functools.cache
 def load_action_from_config(config_string: str):
     """
     根据 "文件路径:函数名" 格式的字符串，动态加载并返回函数。

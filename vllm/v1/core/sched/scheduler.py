@@ -203,6 +203,7 @@ class Scheduler(SchedulerInterface):
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         scheduled_spec_decode_token_top_ks: dict[str, list[list[int]]] = {}
+        scheduled_dyn_token_top_k_formulas: dict[str, Optional[str]] = {}
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -302,6 +303,10 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
+
+            # Dynamic top-k related.
+            scheduled_dyn_token_top_k_formulas[request.request_id] = (
+                request.sampling_params.dyn_topk_formula)
 
             # Speculative decode related.
             if request.spec_token_ids:
@@ -542,6 +547,10 @@ class Scheduler(SchedulerInterface):
                     for i in encoder_inputs_to_schedule:
                         self.encoder_cache_manager.allocate(request, i)
                     encoder_compute_budget = new_encoder_compute_budget
+                
+                # Dynamic top-k related.
+                scheduled_dyn_token_top_k_formulas[request.request_id] = (
+                    request.sampling_params.dyn_topk_formula)
 
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
@@ -594,6 +603,8 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_spec_decode_token_top_ks=(
                 scheduled_spec_decode_token_top_ks),
+            scheduled_dyn_token_top_k_formulas=(
+                scheduled_dyn_token_top_k_formulas),
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
             # finished_req_ids is an existing state in the scheduler,
