@@ -6,8 +6,6 @@ from dataclasses import replace
 from importlib.util import find_spec
 from typing import Optional
 
-import functools
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -26,6 +24,7 @@ from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.utils import is_pin_memory_available
+from vllm.utils.udf import UserDefinedFunctionConfig, load_user_defined_function
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 from vllm.v1.attention.backends.tree_attn import (TreeAttentionMetadata,
                                                   TreeAttentionMetadataBuilder)
@@ -35,7 +34,7 @@ from vllm.v1.attention.backends.utils import (AttentionMetadataBuilder,
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.spec_decode.utils import calc_perplexity, load_action_from_config
+from vllm.v1.spec_decode.utils import calc_perplexity
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
@@ -180,15 +179,11 @@ class EagleProposer:
         else:
             self.positions[:num_tokens] = positions
 
-    def _get_assisted_action(self, config):
-        action = load_action_from_config(config)
-        return action
-
     def get_token_top_ks_from_proposals(
         self,
         token_ids: torch.Tensor,
         logits: torch.Tensor,
-        assisted_action_configs: list[Optional[str]],
+        assisted_action_configs: list[str],
     ) -> torch.Tensor:
         """Get token top-k values from proposal probabilities.
 
@@ -215,12 +210,15 @@ class EagleProposer:
         assert len(assisted_action_configs) == batch_size, \
             f"Expected {batch_size} assisted action configs, " \
             f"but got {len(assisted_action_configs)}"
-        
+
         for req_idx, action_cfg in enumerate(assisted_action_configs):
-            if action_cfg is None or action_cfg.strip() == "":
+            action_cfg = UserDefinedFunctionConfig.loads(action_cfg)
+            if action_cfg is None:
+                logger.warning(f"Assisted action skipped for request {req_idx}")
                 continue
-            assisted_action = self._get_assisted_action(action_cfg)
-            spec_topks = assisted_action(ppls[req_idx], model_config.hf_config)
+            action = load_user_defined_function(action_cfg)
+            logger.warning(f"Using assisted action for request {req_idx}: {action_cfg}")
+            spec_topks = action(ppls[req_idx], model_config.hf_config)
             # The output token guides the top-k of the input token.
             total_topks[:, req_idx, -spec_len-1:-1] = spec_topks
 

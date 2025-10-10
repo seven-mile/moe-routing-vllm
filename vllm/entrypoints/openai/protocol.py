@@ -6,6 +6,7 @@
 import json
 import time
 from http import HTTPStatus
+from frozendict import deepfreeze
 from typing import (Annotated, Any, ClassVar, Generic, Literal, Optional,
                     TypeVar, Union)
 
@@ -71,6 +72,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import (BeamSearchParams, RequestOutputKind,
                                   SamplingParams, StructuredOutputsParams)
 from vllm.utils import random_uuid, resolve_obj_by_qualname
+from vllm.utils.udf import UserDefinedFunctionConfig
 
 logger = init_logger(__name__)
 
@@ -150,6 +152,27 @@ class ModelCard(OpenAIBaseModel):
 class ModelList(OpenAIBaseModel):
     object: str = "list"
     data: list[ModelCard] = Field(default_factory=list)
+
+
+class DynAssistedActionConfig(BaseModel):
+    file: str
+    function: str
+    args: Optional[list[Any]] = None
+    kwargs: Optional[dict[str, Any]] = None
+
+def _dyn_assisted_action_to_udf(
+    action: Optional[DynAssistedActionConfig]
+) -> Optional[UserDefinedFunctionConfig]:
+    if action is None:
+        return None
+    args = deepfreeze(action.args) if action.args is not None else None
+    kwargs = deepfreeze(sorted(action.kwargs.items())) if action.kwargs is not None else None
+    return UserDefinedFunctionConfig(
+        file=action.file,
+        function=action.function,
+        args=args,
+        kwargs=kwargs,
+    )
 
 
 class PromptTokenUsageInfo(OpenAIBaseModel):
@@ -488,7 +511,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     prompt_logprobs: Optional[int] = None
     allowed_token_ids: Optional[list[int]] = None
     bad_words: list[str] = Field(default_factory=list)
-    dyn_topk_formula: Optional[str] = None
+    dyn_assisted_action_config: Optional[DynAssistedActionConfig] = None
     # --8<-- [end:chat-completion-sampling-params]
 
     # --8<-- [start:chat-completion-extra-params]
@@ -796,7 +819,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             structured_outputs=self.structured_outputs,
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
-            dyn_topk_formula=self.dyn_topk_formula,
+            dyn_assisted_action_config=_dyn_assisted_action_to_udf(
+                self.dyn_assisted_action_config),
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
         )

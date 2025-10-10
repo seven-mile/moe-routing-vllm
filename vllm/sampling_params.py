@@ -14,6 +14,7 @@ from pydantic.dataclasses import dataclass
 from vllm.logger import init_logger
 from vllm.logits_process import LogitsProcessor
 from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.utils.udf import UserDefinedFunctionConfig, load_user_defined_function
 
 logger = init_logger(__name__)
 
@@ -201,7 +202,7 @@ class SamplingParams(
     allowed_token_ids: Optional[list[int]] = None
     """If provided, the engine will construct a logits processor which only
     retains scores for the given token ids."""
-    dyn_topk_formula: Optional[str] = None
+    dyn_assisted_action_config_str: str = "null"
     """Control the ppl_to_k formula for the request."""
     extra_args: Optional[dict[str, Any]] = None
     """Arbitrary additional args, that can be used by custom sampling
@@ -248,7 +249,7 @@ class SamplingParams(
         guided_decoding: Optional[GuidedDecodingParams] = None,
         logit_bias: Optional[Union[dict[int, float], dict[str, float]]] = None,
         allowed_token_ids: Optional[list[int]] = None,
-        dyn_topk_formula: Optional[str] = None,
+        dyn_assisted_action_config: Optional[UserDefinedFunctionConfig] = None,
         extra_args: Optional[dict[str, Any]] = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
@@ -300,7 +301,7 @@ class SamplingParams(
             structured_outputs=structured_outputs,
             logit_bias=logit_bias,
             allowed_token_ids=allowed_token_ids,
-            dyn_topk_formula=dyn_topk_formula,
+            dyn_assisted_action_config_str=dyn_assisted_action_config.dumps(),
             extra_args=extra_args,
         )
 
@@ -456,14 +457,19 @@ class SamplingParams(
                 RequestOutputKind.DELTA):
             raise ValueError("best_of must equal n to use output_kind=DELTA")
         
-        from vllm.v1.spec_decode.utils import load_action_from_config
-        if self.dyn_topk_formula:
+        if cfg := self.dyn_assisted_action_config:
+            if not isinstance(cfg, UserDefinedFunctionConfig):
+                raise ValueError(
+                    f"dyn_assisted_action_config must be a UserDefinedFunctionConfig, got {type(cfg)}")
+            if not cfg.file or not cfg.function:
+                raise ValueError(
+                    "Both file and function must be specified in dyn_assisted_action_config")
+            # Try loading the function to catch errors early.
             try:
-                load_action_from_config(self.dyn_topk_formula)
+                load_user_defined_function(cfg)
             except Exception as e:
                 raise ValueError(
-                    f"Failed to load dyn_topk_formula from "
-                    f"{self.dyn_topk_formula}: {e}") from e
+                    f"Failed to load dyn_assisted_action_config: {e}") from e
 
     def _verify_greedy_sampling(self) -> None:
         if self.n > 1:
@@ -548,6 +554,10 @@ class SamplingParams(
     def bad_words_token_ids(self) -> Optional[list[list[int]]]:
         # For internal use only. Backward compatibility not guaranteed
         return self._bad_words_token_ids
+    
+    @property
+    def dyn_assisted_action_config(self) -> Optional[UserDefinedFunctionConfig]:
+        return UserDefinedFunctionConfig.loads(self.dyn_assisted_action_config_str)
 
     def clone(self) -> "SamplingParams":
         """Deep copy, but maybe not the LogitsProcessor objects.

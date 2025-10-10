@@ -203,7 +203,7 @@ class Scheduler(SchedulerInterface):
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         scheduled_spec_decode_token_top_ks: dict[str, list[list[int]]] = {}
-        scheduled_dyn_token_top_k_formulas: dict[str, Optional[str]] = {}
+        scheduled_req_dyn_assisted_action_configs: dict[str, str] = {}
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -305,8 +305,8 @@ class Scheduler(SchedulerInterface):
             req_index += 1
 
             # Dynamic top-k related.
-            scheduled_dyn_token_top_k_formulas[request.request_id] = (
-                request.sampling_params.dyn_topk_formula)
+            scheduled_req_dyn_assisted_action_configs[request.request_id] = \
+                request.sampling_params.dyn_assisted_action_config_str
 
             # Speculative decode related.
             if request.spec_token_ids:
@@ -549,8 +549,8 @@ class Scheduler(SchedulerInterface):
                     encoder_compute_budget = new_encoder_compute_budget
                 
                 # Dynamic top-k related.
-                scheduled_dyn_token_top_k_formulas[request.request_id] = (
-                    request.sampling_params.dyn_topk_formula)
+                scheduled_req_dyn_assisted_action_configs[request.request_id] = (
+                    request.sampling_params.dyn_assisted_action_config_str)
 
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
@@ -603,8 +603,8 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_spec_decode_token_top_ks=(
                 scheduled_spec_decode_token_top_ks),
-            scheduled_dyn_token_top_k_formulas=(
-                scheduled_dyn_token_top_k_formulas),
+            scheduled_req_dyn_assisted_action_configs=(
+                scheduled_req_dyn_assisted_action_configs),
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
             # finished_req_ids is an existing state in the scheduler,
