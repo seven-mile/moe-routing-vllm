@@ -1216,6 +1216,8 @@ class CompletionRequest(OpenAIBaseModel):
         default=None,
         description="KVTransfer parameters used for disaggregated serving.")
 
+    dyn_assisted_action_config: Optional[DynAssistedActionConfig] = None
+
     vllm_xargs: Optional[dict[str, Union[str, int, float]]] = Field(
         default=None,
         description=("Additional request parameters with string or "
@@ -1341,6 +1343,8 @@ class CompletionRequest(OpenAIBaseModel):
             structured_outputs=self.structured_outputs,
             logit_bias=self.logit_bias,
             allowed_token_ids=self.allowed_token_ids,
+            dyn_assisted_action_config=_dyn_assisted_action_to_udf(
+                self.dyn_assisted_action_config),
             extra_args=extra_args or None,
             )
 

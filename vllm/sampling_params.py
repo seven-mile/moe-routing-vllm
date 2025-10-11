@@ -301,7 +301,8 @@ class SamplingParams(
             structured_outputs=structured_outputs,
             logit_bias=logit_bias,
             allowed_token_ids=allowed_token_ids,
-            dyn_assisted_action_config_str=dyn_assisted_action_config.dumps(),
+            dyn_assisted_action_config_str=dyn_assisted_action_config.dumps() \
+                if dyn_assisted_action_config is not None else "null",
             extra_args=extra_args,
         )
 
