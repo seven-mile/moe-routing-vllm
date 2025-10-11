@@ -214,10 +214,10 @@ class EagleProposer:
         for req_idx, action_cfg in enumerate(assisted_action_configs):
             action_cfg = UserDefinedFunctionConfig.loads(action_cfg)
             if action_cfg is None:
-                logger.warning(f"Assisted action skipped for request {req_idx}")
+                logger.warning_once(f"Assisted action skipped for request {req_idx}")
                 continue
             action = load_user_defined_function(action_cfg)
-            logger.warning(f"Using assisted action for request {req_idx}: {action_cfg}")
+            logger.warning_once(f"Using assisted action for request {req_idx}: {action_cfg}")
             spec_topks = action(ppls[req_idx], model_config.hf_config)
             # The output token guides the top-k of the input token.
             total_topks[:, req_idx, -spec_len-1:-1] = spec_topks
