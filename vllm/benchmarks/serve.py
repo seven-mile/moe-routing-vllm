@@ -1134,6 +1134,12 @@ def add_cli_args(parser: argparse.ArgumentParser):
         "in seconds (default: 600 seconds / 10 minutes). If set to 0, "
         "the ready check will be skipped."
     )
+    parser.add_argument(
+        "--dyn-assisted-action-config",
+        type=str,
+        default="null",
+        help="JSON string that specifies the config for dynamic assistance."
+    )
 
 
 def main(args: argparse.Namespace) -> dict[str, Any]:
@@ -1204,6 +1210,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     goodput_config_dict = check_goodput_args(args)
 
     # Collect the sampling parameters.
+    dyn_assisted_action_config = json.loads(args.dyn_assisted_action_config)
     sampling_params = {
         k: v
         for k, v in {
@@ -1211,6 +1218,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             "top_k": args.top_k,
             "min_p": args.min_p,
             "temperature": args.temperature,
+            "dyn_assisted_action_config": dyn_assisted_action_config,
         }.items() if v is not None
     }
 
