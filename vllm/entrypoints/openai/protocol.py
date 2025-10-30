@@ -1700,6 +1700,7 @@ class CompletionResponseChoice(OpenAIBaseModel):
             "including encountering the EOS token"),
     )
     token_ids: Optional[list[int]] = None  # For response
+    token_top_ks: Optional[list[list[int]]] = None
     prompt_logprobs: Optional[list[Optional[dict[int, Logprob]]]] = None
     prompt_token_ids: Optional[list[int]] = None  # For prompt
 
@@ -1736,6 +1737,7 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
     # prompt tokens is put into choice to align with CompletionResponseChoice
     prompt_token_ids: Optional[list[int]] = None
     token_ids: Optional[list[int]] = None
+    token_top_ks: Optional[list[list[int]]] = None
 
 
 class CompletionStreamResponse(OpenAIBaseModel):
@@ -1910,6 +1912,7 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     # not part of the OpenAI spec but is useful for tracing the tokens
     # in agent scenarios
     token_ids: Optional[list[int]] = None
+    token_top_ks: Optional[list[list[int]]] = None
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -1945,6 +1948,7 @@ class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
     stop_reason: Optional[Union[int, str]] = None
     # not part of the OpenAI spec but for tracing the tokens
     token_ids: Optional[list[int]] = None
+    token_top_ks: Optional[list[list[int]]] = None
 
 
 class ChatCompletionStreamResponse(OpenAIBaseModel):

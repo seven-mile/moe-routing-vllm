@@ -184,6 +184,7 @@ class RequestState:
     def make_request_output(
         self,
         new_token_ids: list[int],
+        new_token_top_ks: list[list[int]],
         pooling_output: Optional[torch.Tensor],
         finish_reason: Optional[FinishReason],
         stop_reason: Union[int, str, None],
@@ -203,7 +204,7 @@ class RequestState:
                 request_id, [self._new_pooling_output(pooling_output)],
                 finished)
 
-        output = self._new_completion_output(new_token_ids, finish_reason,
+        output = self._new_completion_output(new_token_ids, new_token_top_ks, finish_reason,
                                              stop_reason)
 
         if self.parent_req is None:
@@ -261,6 +262,7 @@ class RequestState:
     def _new_completion_output(
         self,
         token_ids: list[int],
+        token_top_ks: list[list[int]],
         finish_reason: Optional[FinishReason],
         stop_reason: Union[int, str, None],
     ) -> CompletionOutput:
@@ -272,6 +274,7 @@ class RequestState:
 
         # Prepare text and token_ids, based on delta mode
         text = self.detokenizer.get_next_output_text(finished, delta)
+        assert delta, "NYI"
         if not delta:
             token_ids = self.detokenizer.output_token_ids
 
@@ -284,6 +287,7 @@ class RequestState:
             index=self.request_index,
             text=text,
             token_ids=token_ids,
+            token_top_ks=token_top_ks,
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
@@ -335,6 +339,7 @@ class OutputProcessor:
                 if req_state.queue is not None and (
                         request_output := req_state.make_request_output(
                             new_token_ids=[],
+                            new_token_top_ks=[],
                             # Set pooling_output is not None to
                             # correctly enter the abort pooling branch
                             pooling_output=torch.randn(0, device="cpu")
@@ -420,6 +425,7 @@ class OutputProcessor:
                                            iteration_stats)
 
             new_token_ids = engine_core_output.new_token_ids
+            new_token_top_ks = engine_core_output.new_token_top_ks
             pooling_output = engine_core_output.pooling_output
             finish_reason = engine_core_output.finish_reason
             stop_reason = engine_core_output.stop_reason
@@ -444,7 +450,7 @@ class OutputProcessor:
 
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(
-                    new_token_ids, pooling_output, finish_reason, stop_reason,
+                    new_token_ids, new_token_top_ks, pooling_output, finish_reason, stop_reason,
                     kv_transfer_params):
                 if req_state.queue is not None:
                     # AsyncLLM: put into queue for handling by generate().

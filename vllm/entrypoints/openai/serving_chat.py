@@ -1014,7 +1014,9 @@ class OpenAIServingChat(OpenAIServing):
                             logprobs=logprobs,
                             finish_reason=None,
                             token_ids=(as_list(output.token_ids)
-                                       if request.return_token_ids else None))
+                                       if request.return_token_ids else None),
+                            token_top_ks=as_list(output.token_top_ks),
+                        )
 
                     # if the model is finished generating
                     else:
@@ -1083,7 +1085,9 @@ class OpenAIServingChat(OpenAIServing):
                             finish_reason=finish_reason_,
                             stop_reason=output.stop_reason,
                             token_ids=(as_list(output.token_ids)
-                                       if request.return_token_ids else None))
+                                       if request.return_token_ids else None),
+                            token_top_ks=as_list(output.token_top_ks),
+                        )
 
                         finish_reason_sent[i] = True
 
@@ -1394,6 +1398,7 @@ class OpenAIServingChat(OpenAIServing):
                 stop_reason=output.stop_reason,
                 token_ids=(as_list(output.token_ids)
                            if request.return_token_ids else None),
+                token_top_ks=as_list(output.token_top_ks),
             )
 
             choices.append(choice_data)

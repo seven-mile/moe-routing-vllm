@@ -11,6 +11,8 @@ class SpecDecodeMetadata:
 
     # [num_tokens]
     draft_token_ids: torch.Tensor
+    # [num_tokens, num_moe_layers]
+    draft_token_top_ks: torch.Tensor
     # [batch_size]
     num_draft_tokens: list[int]
     # [batch_size]
@@ -21,6 +23,9 @@ class SpecDecodeMetadata:
     bonus_logits_indices: torch.Tensor
     # [num_tokens + batch_size]
     logits_indices: torch.Tensor
+
+    num_moe_layers: int = 1
+    base_top_k: int = 0
 
     def __post_init__(self):
         self.max_spec_len = max(self.num_draft_tokens)
@@ -39,6 +44,9 @@ class SpecDecodeMetadata:
         draft_token_ids_tensor = torch.tensor(flattened_draft_token_ids,
                                               dtype=torch.int32,
                                               device=device)
+        draft_token_top_ks_tensor = torch.zeros((num_tokens, 1),
+                                              dtype=torch.int32,
+                                              device=device)
         cu_num_draft_tokens = np.cumsum(num_draft_tokens, dtype=np.int32)
         cu_num_draft_tokens_tensor = torch.from_numpy(cu_num_draft_tokens).to(
             device)
@@ -54,6 +62,7 @@ class SpecDecodeMetadata:
                                      device=device)
         return cls(
             draft_token_ids=draft_token_ids_tensor,
+            draft_token_top_ks=draft_token_top_ks_tensor,
             num_draft_tokens=num_draft_tokens,
             cu_num_draft_tokens=cu_num_draft_tokens_tensor,
             target_logits_indices=target_logits_indices,

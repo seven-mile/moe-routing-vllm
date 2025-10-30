@@ -451,11 +451,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             dtype=torch.int64,
             device="cpu",
             pin_memory=self.pin_memory)
+        self._sampled_token_top_ks_pinned_cpu: Optional[torch.Tensor] = None
 
     @property
     def input_top_ks(self) -> CpuGpuBuffer:
         assert self._input_top_ks is not None
         return self._input_top_ks
+
+    @property
+    def sampled_token_top_ks_pinned_cpu(self) -> torch.Tensor:
+        assert self._sampled_token_top_ks_pinned_cpu is not None
+        return self._sampled_token_top_ks_pinned_cpu
 
     def _get_positions(self, num_tokens: Any):
         if isinstance(num_tokens, int):
@@ -1533,13 +1539,19 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         draft_token_ids = self.input_ids.gpu[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
 
+        draft_token_top_ks = self.input_top_ks.gpu[logits_indices]
+        draft_token_top_ks = draft_token_top_ks[target_logits_indices + 1]
+
         metadata = SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
+            draft_token_top_ks=draft_token_top_ks,
             num_draft_tokens=num_draft_tokens.tolist(),
             cu_num_draft_tokens=cu_num_draft_tokens,
             target_logits_indices=target_logits_indices,
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
+            num_moe_layers=self.model.num_moe_layers,
+            base_top_k=self.model_config.get_num_experts_per_token(),
         )
         return metadata
 
@@ -2166,13 +2178,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # separate storage from the original `logits` tensor. Therefore,
             # it is safe to update `target_logits` in place.
             target_logits = logits[spec_decode_metadata.target_logits_indices]
-            output_token_ids = self.rejection_sampler(
+            output_token_ids, output_token_top_ks = self.rejection_sampler(
                 spec_decode_metadata,
                 None,  # draft_probs
                 target_logits,
                 bonus_token_ids,
                 sampling_metadata,
             )
+            # If it's spec decode, all accepted tokens are exactly what we want.
+            sampler_output.token_top_ks = output_token_top_ks
             sampler_output.sampled_token_ids = output_token_ids
             self._update_states_after_model_execute(output_token_ids)
 
@@ -2186,6 +2200,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             dict[str, int],
             Optional[LogprobsLists],
             list[list[int]],
+            list[list[list[int]]],
             dict[str, Optional[LogprobsTensors]],
             list[str],
             dict[str, int],
@@ -2222,6 +2237,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
         sampled_token_ids = sampler_output.sampled_token_ids
+        token_top_ks = sampler_output.token_top_ks
         invalid_req_indices = []
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
@@ -2229,17 +2245,28 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if max_gen_len == 1:
                 # No spec decode tokens.
                 valid_sampled_token_ids = self._to_list(sampled_token_ids)
+                # Prefill, only 1 trivial output token with base_k.
+                base_k = self.model_config.get_num_experts_per_token()
+                valid_token_top_ks = [
+                    [[base_k for _ in range(self.model.num_moe_layers)]]
+                    for _ in range(num_sampled_tokens)
+                ]
             else:
-                # Includes spec decode tokens.
-                valid_sampled_token_ids = self.rejection_sampler.parse_output(
-                    sampled_token_ids,
-                    self.input_batch.vocab_size,
-                )
+                # All input tokens for decode phase are to sample.
+                # So we just take all top-ks of the accepted tokens.
+                valid_sampled_token_ids, valid_token_top_ks = \
+                    self.rejection_sampler.parse_output(
+                        sampled_token_ids,
+                        token_top_ks,
+                        self.input_batch.vocab_size,
+                    )
             # Mask out the sampled tokens that should not be sampled.
             for i in discard_sampled_tokens_req_indices:
                 valid_sampled_token_ids[int(i)].clear()
+                valid_token_top_ks[int(i)].clear()
         else:
             valid_sampled_token_ids = []
+            valid_token_top_ks = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
             invalid_req_indices_set = set(invalid_req_indices)
             assert sampled_token_ids.shape[-1] == 1
@@ -2256,6 +2283,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 for i, req_id in enumerate(self.input_batch.req_ids)
                 if i not in invalid_req_indices_set
             }
+            assert False, "async scheduler compatibility NYI"
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
@@ -2307,6 +2335,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_nans_in_logits,
             logprobs_lists,
             valid_sampled_token_ids,
+            valid_token_top_ks,
             prompt_logprobs_dict,
             req_ids_output_copy,
             req_id_to_index_output_copy,
@@ -2554,6 +2583,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_nans_in_logits,
                 logprobs_lists,
                 valid_sampled_token_ids,
+                valid_token_top_ks,
                 prompt_logprobs_dict,
                 req_ids_output_copy,
                 req_id_to_index_output_copy,
@@ -2575,6 +2605,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
             sampled_token_ids=valid_sampled_token_ids,
+            token_top_ks=valid_token_top_ks,
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],
@@ -3937,6 +3968,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self._input_top_ks = self._make_buffer(self.max_num_tokens,
                                                num_moe_layers,
                                                dtype=torch.int32)
+        self._sampled_token_top_ks_pinned_cpu = torch.empty(
+            (self.max_model_len, 1, num_moe_layers),
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=self.pin_memory)
 
     def _allocate_kv_cache_tensors(
             self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:

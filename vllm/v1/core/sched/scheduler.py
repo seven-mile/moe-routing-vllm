@@ -887,6 +887,7 @@ class Scheduler(SchedulerInterface):
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
         sampled_token_ids = model_runner_output.sampled_token_ids
+        token_top_ks = model_runner_output.token_top_ks
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
@@ -955,6 +956,8 @@ class Scheduler(SchedulerInterface):
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids)
+            new_token_top_ks = token_top_ks[
+                req_index][:len(new_token_ids)] if token_top_ks else []
 
             # Stop checking for pooler models.
             pooler_output = None
@@ -998,6 +1001,7 @@ class Scheduler(SchedulerInterface):
                     EngineCoreOutput(
                         request_id=req_id,
                         new_token_ids=new_token_ids,
+                        new_token_top_ks=new_token_top_ks,
                         finish_reason=request.get_finished_reason(),
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,

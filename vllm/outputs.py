@@ -41,6 +41,7 @@ class CompletionOutput:
     index: int
     text: str
     token_ids: GenericSequence[int]
+    token_top_ks: GenericSequence[GenericSequence[int]]
     cumulative_logprob: Optional[float]
     logprobs: Optional[SampleLogprobs]
     finish_reason: Optional[str] = None

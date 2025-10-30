@@ -104,6 +104,7 @@ class EngineCoreOutput(
 
     request_id: str
     new_token_ids: list[int]
+    new_token_top_ks: list[list[int]]
 
     new_logprobs: Optional[LogprobsLists] = None
     new_prompt_logprobs_tensors: Optional[LogprobsTensors] = None
