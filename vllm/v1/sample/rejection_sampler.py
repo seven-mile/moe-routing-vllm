@@ -223,7 +223,8 @@ def rejection_sample(
             num_warps=1,
         )
         if sampling_metadata.all_greedy:
-            return output_token_ids
+            # Slice the output for correct shape.
+            return output_token_ids, output_token_top_ks[..., :num_moe_layers]
 
     # Generate uniform probabilities for rejection sampling.
     # [num_tokens]
