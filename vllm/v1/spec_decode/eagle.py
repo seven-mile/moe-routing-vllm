@@ -203,9 +203,23 @@ class EagleProposer:
         num_layers = target_model.num_moe_layers
         assert num_layers > 0, "No MoE layers found in the model."
 
+        # Assert input tensors are on-device.
+        assert token_ids.device.type == self.device.type, (
+            f"Expected token_ids to be on device {self.device.type}, "
+            f"but got {token_ids.device.type}."
+        )
+        assert logits.device.type == self.device.type, (
+            f"Expected logits to be on device {self.device.type}, "
+            f"but got {logits.device.type}."
+        )
+
         ppls = calc_perplexity(logits, token_ids)
 
-        total_topks = torch.full((num_layers, batch_size, spec_len+1), base_top_k)
+        total_topks = torch.full(
+            (num_layers, batch_size, spec_len+1),
+            base_top_k,
+            device=self.device,
+        )
 
         assert len(assisted_action_configs) == batch_size, \
             f"Expected {batch_size} assisted action configs, " \
@@ -216,7 +230,8 @@ class EagleProposer:
             if action_cfg is None:
                 continue
             action = load_user_defined_function(action_cfg)
-            spec_topks = action(ppls[req_idx], model_config.hf_config)
+            with torch.device(self.device):
+                spec_topks = action(ppls[req_idx], model_config.hf_config)
             # The output token guides the top-k of the input token.
             total_topks[:, req_idx, -spec_len-1:-1] = spec_topks
 
