@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
+import json
 import os
+import threading
+import time
 from dataclasses import replace
 from importlib.util import find_spec
 from typing import Optional
@@ -43,6 +46,85 @@ logger = init_logger(__name__)
 
 PADDING_SLOT_ID = -1
 
+
+class PPLDumpManager:
+    def __init__(self, dump_dir: str, max_tokens_per_file: int,
+                 dump_interval: float):
+        """Initialize PPL dump manager with background thread.
+        
+        Args:
+            dump_dir: Directory to save PPL dump files
+            max_tokens_per_file: Maximum number of tokens before triggering dump
+            dump_interval: Interval in seconds between periodic dumps
+        """
+        self.dump_dir = dump_dir
+        self.max_tokens_per_file = max_tokens_per_file
+        self.dump_interval = dump_interval
+        self.token_ppls = []
+        self.file_idx = 0
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        
+        # Create dump directory if it doesn't exist
+        if not os.path.exists(self.dump_dir):
+            os.makedirs(self.dump_dir)
+        
+        # Start background thread
+        self.dump_thread = threading.Thread(target=self._dump_loop, daemon=True)
+        self.dump_thread.start()
+    
+    def add_token_ppls(self, ppls: torch.Tensor):
+        """Add token PPLs to the buffer.
+        
+        Args:
+            ppls: Tensor of perplexity values
+        """
+        ppl_list = ppls.view(-1).tolist()
+        with self.lock:
+            self.token_ppls.extend(ppl_list)
+            # Trigger immediate dump if capacity exceeded
+            if len(self.token_ppls) >= self.max_tokens_per_file:
+                self._dump_to_file_unsafe()
+    
+    def _dump_loop(self):
+        """Background thread loop for periodic dumping."""
+        while not self.stop_event.is_set():
+            time.sleep(self.dump_interval)
+            if not self.stop_event.is_set():
+                with self.lock:
+                    if self.token_ppls:
+                        self._dump_to_file_unsafe()
+    
+    def _dump_to_file_unsafe(self):
+        """Dump PPLs to file. Must be called with lock held."""
+        if not self.token_ppls:
+            return
+            
+        file_path = os.path.join(self.dump_dir, f"ppls_{self.file_idx}.json")
+        self.file_idx += 1
+        
+        with open(file_path, "w") as f:
+            json.dump(self.token_ppls, f)
+        
+        logger.info(f"Dumped {len(self.token_ppls)} token ppls to {file_path}")
+        self.token_ppls = []
+    
+    def shutdown(self):
+        """Shutdown the manager and dump remaining data."""
+        self.stop_event.set()
+        self.dump_thread.join(timeout=5.0)
+        
+        # Dump any remaining data
+        with self.lock:
+            if self.token_ppls:
+                self._dump_to_file_unsafe()
+    
+    def __del__(self):
+        """Cleanup on deletion."""
+        try:
+            self.shutdown()
+        except Exception:
+            pass
 
 class EagleProposer:
 
@@ -168,6 +250,19 @@ class EagleProposer:
             dtype=torch.int32,
         ).repeat(max_batch_size, 1)
 
+        # Initialize PPL dump manager if enabled
+        # ppl_dump_dir = "/root/dev/repos/moe-routing/data/dyn_topk/vllm_eagle/ppl"
+        ppl_dump_dir = os.getenv("PPL_DUMP_DIR")
+        if ppl_dump_dir:
+            self.ppl_dump_manager = PPLDumpManager(
+                dump_dir=ppl_dump_dir,
+                max_tokens_per_file=1000000,
+                dump_interval=5.0
+            )
+            logger.info(f"PPL dump manager initialized with dump_dir={ppl_dump_dir}")
+        else:
+            self.ppl_dump_manager = None
+
     def _get_positions(self, num_tokens: int):
         if self.uses_mrope:
             return self.mrope_positions[:, :num_tokens]
@@ -214,6 +309,10 @@ class EagleProposer:
         )
 
         ppls = calc_perplexity(logits, token_ids)
+        
+        # Report PPLs to dump manager if enabled
+        if self.ppl_dump_manager is not None:
+            self.ppl_dump_manager.add_token_ppls(ppls)
 
         total_topks = torch.full(
             (num_layers, batch_size, spec_len+1),
@@ -1115,6 +1214,14 @@ class EagleProposer:
                 for layer_name in self.attn_layer_names
             ])
         ) == 1, "All eagle layers should belong to the same kv cache group"
+
+    def __del__(self):
+        """Cleanup on deletion."""
+        if hasattr(self, 'ppl_dump_manager') and self.ppl_dump_manager is not None:
+            try:
+                self.ppl_dump_manager.shutdown()
+            except Exception:
+                pass
 
 
 # NOTE(woosuk): Currently, the below code is not used and we always use argmax
