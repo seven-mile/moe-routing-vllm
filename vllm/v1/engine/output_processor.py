@@ -274,9 +274,9 @@ class RequestState:
 
         # Prepare text and token_ids, based on delta mode
         text = self.detokenizer.get_next_output_text(finished, delta)
-        assert delta, "NYI"
         if not delta:
             token_ids = self.detokenizer.output_token_ids
+            token_top_ks = self.detokenizer.token_top_ks
 
         # Prepare logprobs, based on delta mode
         logprobs = self.logprobs_processor.logprobs
@@ -438,7 +438,8 @@ class OutputProcessor:
                 assert req_state.logprobs_processor is not None
                 # 2) Detokenize the token ids into text and perform stop checks.
                 stop_string = req_state.detokenizer.update(
-                    new_token_ids, finish_reason == FinishReason.STOP)
+                    new_token_ids, finish_reason == FinishReason.STOP,
+                    new_token_top_ks)
                 if stop_string:
                     finish_reason = FinishReason.STOP
                     stop_reason = stop_string
