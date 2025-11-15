@@ -515,13 +515,12 @@ def rejection_greedy_sample_kernel(
             target_argmax_id = tl.load(target_argmax_ptr + input_pos)
             tl.store(output_token_ids_ptr + output_pos,
                      target_argmax_id)
+            # Collect the output top_k.
+            draft_token_top_k = tl.load(draft_token_top_ks_ptr + input_pos * num_moe_layers + all_layers)
+            tl.store(output_token_top_ks_ptr + output_pos * num_moe_layers + all_layers, draft_token_top_k)
             if draft_token_id != target_argmax_id:
                 # Reject.
                 rejected = True
-            else:
-                # All accepted tokens have top_k = draft_token_top_k.
-                draft_token_top_k = tl.load(draft_token_top_ks_ptr + input_pos * num_moe_layers + all_layers)
-                tl.store(output_token_top_ks_ptr + output_pos * num_moe_layers + all_layers, draft_token_top_k)
 
     if not rejected:
         # If all tokens are accepted, append the bonus token.
@@ -585,14 +584,14 @@ def rejection_random_sample_kernel(
             if draft_prob > 0 and target_prob / draft_prob >= uniform_prob:
                 # Accept.
                 token_id = draft_token_id
-                # All accepted tokens have top_k = draft_token_top_k.
-                draft_token_top_k = tl.load(draft_token_top_ks_ptr + input_pos * num_moe_layers + all_layers)
-                tl.store(output_token_top_ks_ptr + output_pos * num_moe_layers + all_layers, draft_token_top_k)
             else:
                 # Reject. Use recovered token.
                 rejected = True
                 token_id = tl.load(recovered_token_ids_ptr + input_pos)
             tl.store(output_token_ids_ptr + output_pos, token_id)
+            # Collect the output top_k.
+            draft_token_top_k = tl.load(draft_token_top_ks_ptr + input_pos * num_moe_layers + all_layers)
+            tl.store(output_token_top_ks_ptr + output_pos * num_moe_layers + all_layers, draft_token_top_k)
 
     if not rejected:
         # If all tokens are accepted, append the bonus token.
