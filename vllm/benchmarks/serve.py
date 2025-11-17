@@ -581,6 +581,7 @@ async def benchmark(
 
     print(f"Burstiness factor: {burstiness} ({distribution})")
     print(f"Maximum request concurrency: {max_concurrency}")
+    print(f"Dynamic Assisted Action config: {extra_body.get('dyn_assisted_action_config')}")
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
