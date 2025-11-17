@@ -110,7 +110,8 @@ class RejectionSampler(nn.Module):
     @staticmethod
     def parse_output(
         output_token_ids: torch.Tensor,
-        output_token_top_ks: torch.Tensor,
+        sampled_token_top_ks: torch.Tensor,
+        next_draft_first_token_top_ks: torch.Tensor,
         vocab_size: int,
     ) -> list[list[int]]:
         """Parse the output of the rejection sampler.
@@ -126,7 +127,7 @@ class RejectionSampler(nn.Module):
             A list of lists of token IDs.
         """
         output_token_ids_np = output_token_ids.cpu().numpy()
-        output_token_top_ks_np = output_token_top_ks.cpu().numpy()
+        sampled_token_top_ks_np = sampled_token_top_ks.cpu().numpy()
         # Create mask for valid tokens.
         valid_mask = ((output_token_ids_np != PLACEHOLDER_TOKEN_ID) &
                       (output_token_ids_np < vocab_size))
@@ -136,8 +137,11 @@ class RejectionSampler(nn.Module):
         ]
         output_ks = [
             row[valid_mask[i]].tolist()
-            for i, row in enumerate(output_token_top_ks_np)
+            for i, row in enumerate(sampled_token_top_ks_np)
         ]
+        # The last token top k is the first k of next draft.
+        for i in range(len(output_ks)):
+            output_ks[i][-1] = next_draft_first_token_top_ks[i][0].tolist()
         return output_ids, output_ks
 
 

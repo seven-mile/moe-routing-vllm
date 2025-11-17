@@ -738,8 +738,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 end_token_index = start_index + num_spec_tokens
                 self.input_batch.token_ids_cpu[
                     req_index, start_index:end_token_index] = spec_token_ids
+                # NOTE(seven-mile): token topks is 1+gamma, the first k assists
+                # the last one of non-spec tokens.
                 self.input_batch.token_top_ks_cpu[
-                    req_index, start_index:end_token_index] = spec_token_top_ks
+                    req_index, start_index-1:end_token_index] = spec_token_top_ks
                 # NOTE(woosuk): `num_tokens` here may include spec tokens.
                 self.input_batch.num_tokens[req_index] += num_spec_tokens
 
@@ -2186,7 +2188,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 sampling_metadata,
             )
             # If it's spec decode, all accepted tokens are exactly what we want.
-            sampler_output.token_top_ks = output_token_top_ks
+            sampler_output.sampled_token_top_ks = output_token_top_ks
             sampler_output.sampled_token_ids = output_token_ids
             self._update_states_after_model_execute(output_token_ids)
 
@@ -2237,7 +2239,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
         sampled_token_ids = sampler_output.sampled_token_ids
-        token_top_ks = sampler_output.token_top_ks
+        sampled_token_top_ks = sampler_output.sampled_token_top_ks
+        next_draft_first_token_top_ks = self._draft_token_top_ks[:, 0:]
         invalid_req_indices = []
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
@@ -2245,19 +2248,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if max_gen_len == 1:
                 # No spec decode tokens.
                 valid_sampled_token_ids = self._to_list(sampled_token_ids)
-                # Prefill, only 1 trivial output token with base_k.
-                base_k = self.model_config.get_num_experts_per_token()
-                valid_token_top_ks = [
-                    [[base_k for _ in range(self.model.num_moe_layers)]]
-                    for _ in range(num_sampled_tokens)
-                ]
+                valid_token_top_ks = next_draft_first_token_top_ks.tolist()
             else:
                 # All input tokens for decode phase are to sample.
                 # So we just take all top-ks of the accepted tokens.
                 valid_sampled_token_ids, valid_token_top_ks = \
                     self.rejection_sampler.parse_output(
                         sampled_token_ids,
-                        token_top_ks,
+                        sampled_token_top_ks,
+                        next_draft_first_token_top_ks,
                         self.input_batch.vocab_size,
                     )
             # Mask out the sampled tokens that should not be sampled.
@@ -2771,6 +2770,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             actions = scheduler_output.scheduled_req_dyn_assisted_action_configs
             actions = [actions[req_id] for req_id in self.input_batch.req_ids]
 
+            # NOTE(seven-mile): The shape changes here.
+            # draft_token_logits: gamma token logits
+            # draft_token_top_ks: 1+gamma token topks
             draft_token_top_ks = self.drafter.get_token_top_ks_from_proposals(
                 draft_token_ids, draft_token_logits, actions)
 

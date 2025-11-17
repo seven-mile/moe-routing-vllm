@@ -318,7 +318,7 @@ class Scheduler(SchedulerInterface):
                     del request.spec_token_ids[num_scheduled_spec_tokens:]
                     scheduled_spec_decode_tokens[request.request_id] = (
                         request.spec_token_ids)
-                    del request.spec_token_top_ks[num_scheduled_spec_tokens:]
+                    del request.spec_token_top_ks[num_scheduled_spec_tokens+1:]
                     scheduled_spec_decode_token_top_ks[request.request_id] = (
                         request.spec_token_top_ks)
 
@@ -1127,7 +1127,8 @@ class Scheduler(SchedulerInterface):
                     spec_token_ids)
             else:
                 request.spec_token_ids = spec_token_ids
-            request.spec_token_top_ks = spec_token_top_ks[:len(request.spec_token_ids)]
+            # NOTE(seven-mile): 1+gamma token topks.
+            request.spec_token_top_ks = spec_token_top_ks
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
