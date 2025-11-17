@@ -151,6 +151,7 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_MOE_FP16: bool = False
     VLLM_USE_FLASHINFER_MOE_FP8: bool = False
     VLLM_USE_FLASHINFER_MOE_FP4: bool = False
+    VLLM_DYN_TOPK_APPLY_LAST_TOKEN: bool = False
     VLLM_FLASHINFER_MOE_BACKEND: Literal["throughput",
                                          "latency"] = "throughput"
     VLLM_XGRAMMAR_CACHE_MB: int = 0
@@ -1193,6 +1194,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_FLASHINFER_MOE_FP4":
     lambda: bool(int(os.getenv("VLLM_USE_FLASHINFER_MOE_FP4", "0"))),
 
+    # If set to 1, extraly apply dynamic top-k on the last token with mean k.
+    "VLLM_DYN_TOPK_APPLY_LAST_TOKEN":
+    lambda: bool(int(os.getenv("VLLM_DYN_TOPK_APPLY_LAST_TOKEN", "0"))),
+
     # If set to 1, use the FlashInfer
     # MXFP8 (activation) x MXFP4 (weight) MoE backend.
     "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8":
@@ -1567,6 +1572,7 @@ def compute_hash() -> str:
         "VLLM_USE_FLASHINFER_MOE_FP16",
         "VLLM_USE_FLASHINFER_MOE_FP8",
         "VLLM_USE_FLASHINFER_MOE_FP4",
+        "VLLM_DYN_TOPK_APPLY_LAST_TOKEN",
         "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8",
         "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS",
         "VLLM_USE_FLASHINFER_MOE_MXFP4_BF16",

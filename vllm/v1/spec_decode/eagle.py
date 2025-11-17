@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.attention.layer import Attention
 from vllm.config import (CompilationLevel, VllmConfig,
                          get_layers_from_vllm_config)
@@ -331,8 +332,12 @@ class EagleProposer:
             action = load_user_defined_function(action_cfg)
             with torch.device(self.device):
                 spec_topks = action(ppls[req_idx], model_config.hf_config)
-            # The output token guides the top-k of the input token.
-            total_topks[:, req_idx, -spec_len-1:-1] = spec_topks
+                # The output token guides the top-k of the input token.
+                total_topks[:, req_idx, :-1] = spec_topks
+                # The last token's top-k is determined by the mean k.
+                if envs.VLLM_DYN_TOPK_APPLY_LAST_TOKEN:
+                    last_topks = torch.mean(spec_topks, dim=-1, dtype=torch.float32)
+                    total_topks[:, req_idx, -1] = last_topks
 
         # Swap num_layers to inner dim for better input organization.
         total_topks = total_topks.permute(1, 2, 0).contiguous()
