@@ -293,7 +293,7 @@ class EagleProposer:
         batch_size, spec_len = token_ids.shape
         
         base_top_k = model_config.get_num_experts_per_token()
-        target_model = self.runner.model
+        target_model = self.runner.get_model()
         assert is_mixture_of_experts(target_model), (
             "The model must be a mixture of experts model.")
         num_layers = target_model.num_moe_layers

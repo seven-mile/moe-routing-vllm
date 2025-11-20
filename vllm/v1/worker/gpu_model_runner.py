@@ -451,17 +451,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             dtype=torch.int64,
             device="cpu",
             pin_memory=self.pin_memory)
-        self._sampled_token_top_ks_pinned_cpu: Optional[torch.Tensor] = None
 
     @property
     def input_top_ks(self) -> CpuGpuBuffer:
         assert self._input_top_ks is not None
         return self._input_top_ks
-
-    @property
-    def sampled_token_top_ks_pinned_cpu(self) -> torch.Tensor:
-        assert self._sampled_token_top_ks_pinned_cpu is not None
-        return self._sampled_token_top_ks_pinned_cpu
 
     def _get_positions(self, num_tokens: Any):
         if isinstance(num_tokens, int):
@@ -2866,6 +2860,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 rank_mapping,
             )
 
+        self._reinitialize_token_top_ks_buffer()
+
         if (
             self.vllm_config.compilation_config.level == \
                 CompilationLevel.DYNAMO_AS_IS and supports_dynamo()
@@ -3970,11 +3966,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self._input_top_ks = self._make_buffer(self.max_num_tokens,
                                                num_moe_layers,
                                                dtype=torch.int32)
-        self._sampled_token_top_ks_pinned_cpu = torch.empty(
-            (self.max_model_len, 1, num_moe_layers),
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=self.pin_memory)
 
     def _allocate_kv_cache_tensors(
             self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
@@ -4202,7 +4193,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self.may_reinitialize_input_batch(kv_cache_config)
-        self._reinitialize_token_top_ks_buffer()
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config)
