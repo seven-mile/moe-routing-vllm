@@ -3025,7 +3025,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             return {}
 
     @contextmanager
-    def maybe_randomize_inputs(self, input_ids: torch.Tensor):
+    def maybe_randomize_inputs(
+        self,
+        input_ids: torch.Tensor,
+        input_top_ks: Optional[torch.Tensor] = None,
+    ):
         """
         Randomize input_ids if VLLM_RANDOMIZE_DP_DUMMY_INPUTS is set.
         This is to help balance expert-selection
@@ -3050,6 +3054,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             logger.debug_once("Randomizing dummy data for DP Rank")
             input_ids.copy_(rand_input_ids()[:input_ids.size(0)],
                             non_blocking=True)
+            if input_top_ks is not None:
+                base_top_k = self.model_config.get_num_experts_per_token()
+                input_top_ks.fill_(base_top_k)
             yield
             input_ids.fill_(0)
 
@@ -3275,6 +3282,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if (self.supports_mm_inputs
                     and not self.model_config.is_encoder_decoder):
                 input_ids = None
+                input_top_ks = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens]
                 model_kwargs = {
                     **model_kwargs,
@@ -3282,10 +3290,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 }
             elif self.enable_prompt_embeds:
                 input_ids = None
+                input_top_ks = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens]
                 model_kwargs = self._init_model_kwargs(num_tokens)
             else:
                 input_ids = self.input_ids.gpu[:num_tokens]
+                input_top_ks = self.input_top_ks.gpu[:num_tokens]
                 inputs_embeds = None
 
             if self.uses_mrope:
@@ -3329,14 +3339,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_after_padding
 
-            with self.maybe_randomize_inputs(input_ids), set_forward_context(
+            with self.maybe_randomize_inputs(input_ids, input_top_ks), set_forward_context(
                     attn_metadata,
                     self.vllm_config,
                     num_tokens=num_tokens_after_padding,
                     num_tokens_across_dp=num_tokens_across_dp,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
-                    ubatch_slices=ubatch_slices):
+                    ubatch_slices=ubatch_slices,
+                    token_top_ks=input_top_ks,
+                ):
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
