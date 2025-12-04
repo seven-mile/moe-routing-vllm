@@ -283,6 +283,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         expert_load_view: Optional[torch.Tensor] = None,
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
+        token_top_ks: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         raise NotImplementedError
 
@@ -487,6 +488,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         expert_load_view: Optional[torch.Tensor] = None,
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
+        token_top_ks: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         if enable_eplb:
             assert expert_load_view is not None
@@ -515,6 +517,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             expert_load_view=expert_load_view,
             logical_to_physical_map=logical_to_physical_map,
             logical_replica_count=logical_replica_count,
+            token_top_ks=token_top_ks,
         )
 
     def get_fused_moe_quant_config(
@@ -549,6 +552,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         expert_load_view: Optional[torch.Tensor] = None,
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
+        token_top_ks: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
 
         zero_expert_num = getattr(layer, 'zero_expert_num', 0)
@@ -578,7 +582,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             logical_replica_count=logical_replica_count,
             global_num_experts=global_num_experts,
             zero_expert_num=zero_expert_num,
-            zero_expert_type=zero_expert_type)
+            zero_expert_type=zero_expert_type,
+            token_top_ks=token_top_ks,
+        )
 
         if self.rocm_aiter_moe_enabled:
             assert self.fused_experts is None
@@ -661,7 +667,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         expert_load_view: Optional[torch.Tensor] = None,
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
+        token_top_ks: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        if token_top_ks is not None:
+            raise NotImplementedError(
+                "Per-token top-k is not supported for CPU.")
         if enable_eplb is not False or expert_load_view is not None or \
                 logical_to_physical_map is not None or \
                 logical_replica_count is not None:
@@ -708,7 +718,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         expert_load_view: Optional[torch.Tensor] = None,
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
+        token_top_ks: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        if token_top_ks is not None:
+            raise NotImplementedError(
+                "Per-token top-k is not supported for XPU.")
         if enable_eplb is not False or expert_load_view is not None or \
                 logical_to_physical_map is not None or \
                 logical_replica_count is not None:
@@ -747,7 +761,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         expert_load_view: Optional[torch.Tensor] = None,
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
+        token_top_ks: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        if token_top_ks is not None:
+            raise NotImplementedError(
+                "Per-token top-k is not supported for TPU.")
         assert not use_grouped_topk
         assert num_expert_group is None
         assert topk_group is None
@@ -1716,6 +1734,7 @@ class FusedMoE(CustomOp):
         global_num_experts: Optional[int] = None,
         zero_expert_num: Optional[int] = None,
         zero_expert_type: Optional[str] = None,
+        token_top_ks: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Route the input hidden states to the top-k experts based on the
@@ -1745,7 +1764,9 @@ class FusedMoE(CustomOp):
 
         # DeepSeekv2 uses grouped_top_k
         if use_grouped_topk:
-            assert False, "expert weights mask NYI"
+            if token_top_ks is not None:
+                raise NotImplementedError(
+                    "token_top_ks with grouped_topk is not supported yet.")
             assert topk_group is not None
             assert num_expert_group is not None
             topk_weights, topk_ids = grouped_topk(
@@ -1761,7 +1782,10 @@ class FusedMoE(CustomOp):
             if indices_type is not None:
                 topk_ids = topk_ids.to(dtype=indices_type)
         elif e_score_correction_bias is not None:
-            assert False, "expert weights mask NYI"
+            if token_top_ks is not None:
+                raise NotImplementedError(
+                    "token_top_ks with e_score_correction_bias is not "
+                    "supported yet.")
             topk_weights, topk_ids = fused_topk_bias(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -1772,7 +1796,9 @@ class FusedMoE(CustomOp):
             if routed_scaling_factor is not None:
                 topk_weights *= routed_scaling_factor
         elif custom_routing_function is None:
-            assert renormalize, "non-renormalized weights mask NYI"
+            if not renormalize:
+                raise ValueError(
+                    "renormalize must be True when using default routing.")
             topk_weights, topk_ids, token_expert_indices = fused_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -1780,9 +1806,13 @@ class FusedMoE(CustomOp):
                 renormalize=renormalize,
                 indices_type=indices_type,
                 layer_idx=layer_idx,
+                token_top_ks=token_top_ks,
             )
         else:
-            assert False, "expert weights mask NYI"
+            if token_top_ks is not None:
+                raise NotImplementedError(
+                    "token_top_ks with custom_routing_function is not "
+                    "supported yet.")
             topk_weights, topk_ids = custom_routing_function(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -1893,6 +1923,7 @@ class FusedMoE(CustomOp):
         self,
         full_hidden_states: torch.Tensor,
         full_router_logits: torch.Tensor,
+        full_token_top_ks: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         assert self.batched_hidden_states is not None
         assert self.batched_router_logits is not None
@@ -1915,6 +1946,10 @@ class FusedMoE(CustomOp):
             chunk_size = chunk_end - chunk_start
             hidden_states = full_hidden_states[chunk_start:chunk_end, :]
             router_logits = full_router_logits[chunk_start:chunk_end, :]
+            if full_token_top_ks is not None:
+                token_top_ks = full_token_top_ks[chunk_start:chunk_end]
+            else:
+                token_top_ks = None
 
             assert self.batched_hidden_states is not None
             assert self.batched_router_logits is not None
@@ -1972,6 +2007,7 @@ class FusedMoE(CustomOp):
                 expert_load_view=self.expert_load_view,
                 logical_to_physical_map=self.logical_to_physical_map,
                 logical_replica_count=self.logical_replica_count,
+                token_top_ks=token_top_ks,
             )
 
             if shared_output is not None:
@@ -2043,6 +2079,8 @@ class FusedMoE(CustomOp):
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         assert self.quant_method is not None
 
+        token_top_ks = get_forward_context().token_top_ks
+
         self.ensure_moe_quant_config()
 
         # Route to the chunked forward path using the FlashInfer Cutlass kernel
@@ -2053,7 +2091,7 @@ class FusedMoE(CustomOp):
         if (self.moe_parallel_config.use_pplx_kernels
                 or self.moe_parallel_config.use_deepep_ll_kernels
                 or _use_flashinfer_cutlass_kernels):
-            return self.forward_impl_chunked(hidden_states, router_logits)
+            return self.forward_impl_chunked(hidden_states, router_logits, token_top_ks)
 
         do_naive_dispatch_combine: bool = (
             self.dp_size > 1
@@ -2101,6 +2139,7 @@ class FusedMoE(CustomOp):
                 expert_load_view=self.expert_load_view,
                 logical_to_physical_map=self.logical_to_physical_map,
                 logical_replica_count=self.logical_replica_count,
+                token_top_ks=token_top_ks,
             )
 
             if shared_output is not None:

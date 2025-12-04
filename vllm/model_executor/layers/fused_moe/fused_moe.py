@@ -952,11 +952,11 @@ def try_get_optimal_moe_config(
 def _apply_token_top_ks(
     topk_indices: torch.Tensor,
     topk_weights: torch.Tensor,
-    layer_idx: Optional[int] = None
-) -> None:
-    token_top_ks = get_forward_context().token_top_ks
+    layer_idx: Optional[int] = None,
+    token_top_ks: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     if token_top_ks is None:
-        return
+        return topk_indices, topk_weights
     # Mask out the invalid top-k weights for each token.
     if token_top_ks.ndim == 2:
         assert layer_idx is not None, "layer_idx must be provided for layerwise dynamic top-k"
@@ -968,15 +968,18 @@ def _apply_token_top_ks(
     )
     num_tokens, topk = topk_weights.shape
     topk_mask = torch.arange(topk, device=topk_weights.device) >= token_top_ks[:, None]
-    topk_indices.masked_fill_(topk_mask, -1)
-    topk_weights.masked_fill_(topk_mask, 0.0)
+    topk_indices = topk_indices.masked_fill(topk_mask, -1)
+    topk_weights = topk_weights.masked_fill(topk_mask, 0.0)
+
+    return topk_indices, topk_weights
 
 
 def vllm_topk_softmax(topk_weights: torch.Tensor, topk_indices: torch.Tensor,
                       token_expert_indices: torch.Tensor,
                       gating_output: torch.Tensor,
                       renormalize: bool,
-                      layer_idx: Optional[int]) -> tuple[torch.Tensor, ...]:
+                      layer_idx: Optional[int],
+                      token_top_ks: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, ...]:
     ops.topk_softmax(
         topk_weights,
         topk_indices,
@@ -984,7 +987,7 @@ def vllm_topk_softmax(topk_weights: torch.Tensor, topk_indices: torch.Tensor,
         gating_output,
     )
 
-    _apply_token_top_ks(topk_indices, topk_weights, layer_idx)
+    topk_indices, topk_weights = _apply_token_top_ks(topk_indices, topk_weights, layer_idx, token_top_ks)
 
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -1006,6 +1009,7 @@ def fused_topk(
     renormalize: bool,
     indices_type: Optional[torch.dtype] = None,
     layer_idx: Optional[int] = None,
+    token_top_ks: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert hidden_states.size(0) == gating_output.size(0), (
         "Number of tokens mismatch")
@@ -1032,7 +1036,7 @@ def fused_topk(
     topk_weights, topk_ids = topk_func(topk_weights, topk_ids,
                                        token_expert_indices,
                                        gating_output_float, renormalize,
-                                       layer_idx)
+                                       layer_idx, token_top_ks)
 
     return topk_weights, topk_ids, token_expert_indices
 

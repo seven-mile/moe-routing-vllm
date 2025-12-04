@@ -395,7 +395,11 @@ def rocm_aiter_topk_softmax(topk_weights: torch.Tensor,
                             token_expert_indices: torch.Tensor,
                             gating_output: torch.Tensor,
                             renormalize: bool,
-                            layer_idx: Optional[int]) -> tuple[torch.Tensor, ...]:
+                            layer_idx: Optional[int],
+                            token_top_ks: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, ...]:
+    if token_top_ks is not None:
+        raise NotImplementedError(
+            "Per-token top-k is not supported for ROCm AITER.")
     torch.ops.vllm.rocm_aiter_topk_softmax(topk_weights, topk_indices,
                                            token_expert_indices, gating_output,
                                            renormalize)
