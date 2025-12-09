@@ -3051,14 +3051,26 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     high=self.model_config.get_vocab_size(),
                     dtype=input_ids.dtype)
 
+            @functools.cache
+            def rand_input_top_ks() -> torch.Tensor:
+                base_top_k = self.model_config.get_num_experts_per_token()
+                return torch.randint_like(
+                    self.input_ids.gpu,
+                    low=1,
+                    high=base_top_k, # intentionally exclusive
+                    dtype=input_ids.dtype)
+
             logger.debug_once("Randomizing dummy data for DP Rank")
             input_ids.copy_(rand_input_ids()[:input_ids.size(0)],
                             non_blocking=True)
             if input_top_ks is not None:
-                base_top_k = self.model_config.get_num_experts_per_token()
-                input_top_ks.fill_(base_top_k)
+                input_top_ks.copy_(rand_input_top_ks()[:input_top_ks.size(0)],
+                                   non_blocking=True)
             yield
             input_ids.fill_(0)
+            if input_top_ks is not None:
+                base_top_k = self.model_config.get_num_experts_per_token()
+                input_top_ks.fill_(base_top_k)
 
     def _get_mm_dummy_batch(
         self,
