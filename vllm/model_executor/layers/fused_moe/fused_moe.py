@@ -954,9 +954,9 @@ def _apply_token_top_ks(
     topk_weights: torch.Tensor,
     layer_idx: Optional[int] = None,
     token_top_ks: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+):
     if token_top_ks is None:
-        return topk_indices, topk_weights
+        return
     # Mask out the invalid top-k weights for each token.
     if token_top_ks.ndim == 2:
         assert layer_idx is not None, "layer_idx must be provided for layerwise dynamic top-k"
@@ -968,10 +968,10 @@ def _apply_token_top_ks(
     )
     num_tokens, topk = topk_weights.shape
     topk_mask = torch.arange(topk, device=topk_weights.device) >= token_top_ks[:, None]
-    topk_indices = topk_indices.masked_fill(topk_mask, -1)
-    topk_weights = topk_weights.masked_fill(topk_mask, 0.0)
-
-    return topk_indices, topk_weights
+    if topk_indices.dtype == torch.uint32:
+        topk_indices = topk_indices.view(torch.int32)
+    topk_indices.masked_fill_(topk_mask, -1)
+    topk_weights.masked_fill_(topk_mask, 0.0)
 
 
 def vllm_topk_softmax(topk_weights: torch.Tensor, topk_indices: torch.Tensor,
@@ -987,7 +987,7 @@ def vllm_topk_softmax(topk_weights: torch.Tensor, topk_indices: torch.Tensor,
         gating_output,
     )
 
-    topk_indices, topk_weights = _apply_token_top_ks(topk_indices, topk_weights, layer_idx, token_top_ks)
+    _apply_token_top_ks(topk_indices, topk_weights, layer_idx, token_top_ks)
 
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
