@@ -2249,9 +2249,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 valid_sampled_token_ids, valid_token_top_ks = \
                     self.rejection_sampler.parse_output(
                         sampled_token_ids,
+                        self.input_batch.vocab_size,
                         sampled_token_top_ks,
                         next_draft_first_token_top_ks,
-                        self.input_batch.vocab_size,
                     )
             # Mask out the sampled tokens that should not be sampled.
             for i in discard_sampled_tokens_req_indices:
