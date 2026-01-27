@@ -2234,7 +2234,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
         sampled_token_ids = sampler_output.sampled_token_ids
         sampled_token_top_ks = sampler_output.sampled_token_top_ks
-        next_draft_first_token_top_ks = self._draft_token_top_ks[:, 0:]
+        next_draft_first_token_top_ks = (
+            self._draft_token_top_ks[:, 0:]
+            if self._draft_token_top_ks is not None
+            else torch.tensor([
+                [[8 for _ in range(self.model.num_moe_layers)]]
+                for _ in range(num_sampled_tokens)
+            ], device='cpu')
+        )
         invalid_req_indices = []
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
