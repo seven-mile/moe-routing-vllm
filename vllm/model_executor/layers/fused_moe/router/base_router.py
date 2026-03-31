@@ -5,6 +5,7 @@ from collections.abc import Callable
 
 import torch
 
+from vllm import envs
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
@@ -192,7 +193,8 @@ class BaseRouter(FusedMoERouter):
         topk_mask = torch.arange(topk, device=topk_weights.device) >= token_top_ks[:, None]
         if topk_indices.dtype == torch.uint32:
             topk_indices = topk_indices.view(torch.int32)
-        topk_indices.masked_fill_(topk_mask, -1)
+        if not envs.VLLM_DYN_TOPKS_NO_DROP_TOKENS:
+            topk_indices.masked_fill_(topk_mask, -1)
         topk_weights.masked_fill_(topk_mask, 0.0)
 
     def _convert_indices_dtype(
@@ -279,7 +281,7 @@ class BaseRouter(FusedMoERouter):
             token_top_ks=token_top_ks,
         )
 
-        # Step 5: Convert indices dtype
+        # Step 6: Convert indices dtype
         topk_ids = self._convert_indices_dtype(topk_ids, indices_type)
 
         return topk_weights, topk_ids
