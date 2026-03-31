@@ -1217,7 +1217,7 @@ if not ext_modules:
 else:
     cmdclass = {
         "build_ext": precompiled_build_ext
-        if USE_PRECOMPILED_EXTENSIONS
+        if USE_PRECOMPILED_EXTENSIONS or envs.VLLM_SKIP_CMAKE
         else cmake_build_ext,
     }
 if (
