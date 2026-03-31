@@ -1450,8 +1450,8 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         layer: FusedMoE,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Optionally prepare extra tensors to carry through DP allgather/EP."""
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Optionally prepare named tensors to carry through DP allgather/EP."""
         if self.nvfp4_backend != NvFp4MoeBackend.FLASHINFER_TRTLLM:
             raise RuntimeError(
                 "prepare_dp_allgather_tensor is only supported for "
@@ -1465,7 +1465,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             layer.a1_gscale,
             is_sf_swizzled_layout=False,
         )
-        extra_tensors: list[torch.Tensor] = [hidden_states_sf]
+        extra_tensors = {"hidden_states_sf": hidden_states_sf}
         return hidden_states_fp4, extra_tensors
 
     def get_fused_moe_quant_config(

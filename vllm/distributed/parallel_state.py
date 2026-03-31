@@ -1005,10 +1005,10 @@ class GroupCoordinator:
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         is_sequence_parallel: bool = False,
-        extra_tensors: list[torch.Tensor] | None = None,
+        extra_tensors: dict[str, torch.Tensor] | None = None,
     ) -> (
         tuple[torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]
+        | tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]
     ):
         if self.device_communicator is not None:
             return self.device_communicator.dispatch_router_logits(

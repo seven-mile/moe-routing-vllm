@@ -1866,9 +1866,6 @@ class FusedMoE(CustomOp):
         do_naive_dispatch_combine = (
             self.dp_size > 1 and not self.quant_method.supports_internal_mk
         )
-        if token_top_ks is not None and do_naive_dispatch_combine:
-            raise RuntimeError("naive dispatch/combine not compatible with dynamic top-k")
-
         sp_ctx = (
             ctx.dp_metadata.sp_local_sizes(self.sp_size)
             if ctx.dp_metadata
@@ -1876,7 +1873,7 @@ class FusedMoE(CustomOp):
         )
 
         with sp_ctx:
-            extra_tensors = None
+            extra_tensors = {}
             if do_naive_dispatch_combine:
                 post_quant_allgather = (
                     self.quant_method is not None
@@ -1885,30 +1882,44 @@ class FusedMoE(CustomOp):
                     and getattr(self.quant_method, "do_post_quant_allgather", False)
                 )
                 if post_quant_allgather:
-                    hidden_states_to_dispatch, extra_tensors = (
+                    hidden_states_to_dispatch, quant_extra_tensors = (
                         self.quant_method.prepare_dp_allgather_tensor(
                             self, hidden_states, router_logits
                         )
                     )
+                    assert extra_tensors & quant_extra_tensors == {}, (
+                        "extra_tensors and quant_extra_tensors keys must be disjoint"
+                    )
+                    extra_tensors.update(quant_extra_tensors)
                 else:
                     hidden_states_to_dispatch = hidden_states
 
+                if token_top_ks is not None:
+                    extra_tensors["token_top_ks"] = token_top_ks
                 dispatch_res = get_ep_group().dispatch_router_logits(
                     hidden_states_to_dispatch,
                     router_logits,
                     self.is_sequence_parallel,
                     extra_tensors=extra_tensors,
                 )
-                if extra_tensors is not None:
+                if extra_tensors:
                     (
-                        orig_hidden_states,
+                        hidden_states_combined,
                         router_logits,
                         extra_tensors_combined,
                     ) = dispatch_res
-                    hidden_states_combined = (
-                        orig_hidden_states,
-                        extra_tensors_combined[0],
-                    )
+                    orig_hidden_states = hidden_states_combined
+
+                    if "hidden_states_sf" in extra_tensors_combined:
+                        hidden_states_sf = extra_tensors_combined["hidden_states_sf"]
+
+                        hidden_states_combined = (
+                            hidden_states_combined,
+                            hidden_states_sf,
+                        )
+
+                    if "token_top_ks" in extra_tensors_combined:
+                        token_top_ks = extra_tensors_combined["token_top_ks"]
                 else:
                     hidden_states_combined, router_logits = dispatch_res
                     orig_hidden_states = hidden_states_combined
@@ -1934,6 +1945,11 @@ class FusedMoE(CustomOp):
                     router_logits,
                     dim=0,
                 )
+                if token_top_ks is not None:
+                    token_top_ks = get_pcp_group().all_gather(
+                        token_top_ks,
+                        dim=0,
+                    )
 
             # Matrix multiply.
             x = hidden_states_combined if do_naive_dispatch_combine else hidden_states
