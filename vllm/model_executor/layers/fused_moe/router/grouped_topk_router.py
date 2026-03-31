@@ -252,6 +252,7 @@ class GroupedTopKRouter(BaseRouter):
         top_k: int,
         global_num_experts: int,
         eplb_state: EplbLayerState,
+        moe_layer_idx: int,
         num_expert_group: int,
         topk_group: int,
         renormalize: bool = True,
@@ -266,6 +267,7 @@ class GroupedTopKRouter(BaseRouter):
             top_k=top_k,
             global_num_experts=global_num_experts,
             eplb_state=eplb_state,
+            moe_layer_idx=moe_layer_idx,
             enable_eplb=enable_eplb,
             indices_type_getter=indices_type_getter,
         )

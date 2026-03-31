@@ -110,7 +110,7 @@ class BaseRouter(FusedMoERouter):
         top_k: int,
         global_num_experts: int,
         eplb_state: EplbLayerState,
-        layer_idx: int | None = None,
+        moe_layer_idx: int | None = None,
         enable_eplb: bool = False,
         # TODO(bnell): Once the MK is constructed at layer init time, we
         # can make this a plain value instead of a callback.
@@ -126,7 +126,7 @@ class BaseRouter(FusedMoERouter):
         self.top_k = top_k
         self.global_num_experts = global_num_experts
         self.eplb_state = eplb_state
-        self.layer_idx = layer_idx
+        self.moe_layer_idx = moe_layer_idx
         self.enable_eplb = enable_eplb
         self.indices_type_getter = indices_type_getter
         self.capture_fn: Callable[[torch.Tensor], None] | None = None
@@ -177,12 +177,12 @@ class BaseRouter(FusedMoERouter):
     ):
         if token_top_ks is None:
             return
-        layer_idx = self.layer_idx
-        assert layer_idx is not None
+        moe_layer_idx = self.moe_layer_idx
+        assert moe_layer_idx is not None
         # Mask out the invalid top-k weights for each token.
         if token_top_ks.ndim == 2:
-            assert layer_idx is not None, "layer_idx must be provided for layerwise dynamic top-k"
-            token_top_ks = token_top_ks[:, layer_idx]
+            assert moe_layer_idx is not None, "moe_layer_idx must be provided for layerwise dynamic top-k"
+            token_top_ks = token_top_ks[:, moe_layer_idx]
         else:
             assert token_top_ks.ndim == 1, "token_top_ks must be 1D or 2D"
         assert token_top_ks.shape == topk_indices.shape[:-1], (

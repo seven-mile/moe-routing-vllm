@@ -412,6 +412,7 @@ class FusedMoE(CustomOp):
         if prefix in compilation_config.static_forward_context:
             raise ValueError("Duplicate layer name: {}".format(prefix))
         compilation_config.static_forward_context[prefix] = self
+        self.moe_layer_idx = len(compilation_config.static_all_moe_layers)
         compilation_config.static_all_moe_layers.append(prefix)
         self.layer_name = prefix
         from vllm.model_executor.models.utils import extract_layer_index
@@ -534,7 +535,10 @@ class FusedMoE(CustomOp):
             top_k=top_k,
             global_num_experts=self.global_num_experts,
             eplb_state=self.eplb_state,
-            layer_idx=self.layer_idx,
+            # NOTE: This relies on that MTP layers are at the end of the model
+            # and moe_layer_idx is assigned in order. If that ever changes,
+            # we should add a more robust way to determine the index.
+            moe_layer_idx=self.moe_layer_idx,
             renormalize=renormalize,
             use_grouped_topk=use_grouped_topk,
             num_expert_group=num_expert_group,
