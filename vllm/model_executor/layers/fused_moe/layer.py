@@ -1896,33 +1896,28 @@ class FusedMoE(CustomOp):
 
                 if token_top_ks is not None:
                     extra_tensors["token_top_ks"] = token_top_ks
-                dispatch_res = get_ep_group().dispatch_router_logits(
+                (
+                    hidden_states_combined,
+                    router_logits,
+                    extra_tensors_combined,
+                ) = get_ep_group().dispatch_router_logits(
                     hidden_states_to_dispatch,
                     router_logits,
                     self.is_sequence_parallel,
                     extra_tensors=extra_tensors,
                 )
-                if extra_tensors:
-                    (
+                orig_hidden_states = hidden_states_combined
+
+                if "hidden_states_sf" in extra_tensors_combined:
+                    hidden_states_sf = extra_tensors_combined["hidden_states_sf"]
+
+                    hidden_states_combined = (
                         hidden_states_combined,
-                        router_logits,
-                        extra_tensors_combined,
-                    ) = dispatch_res
-                    orig_hidden_states = hidden_states_combined
+                        hidden_states_sf,
+                    )
 
-                    if "hidden_states_sf" in extra_tensors_combined:
-                        hidden_states_sf = extra_tensors_combined["hidden_states_sf"]
-
-                        hidden_states_combined = (
-                            hidden_states_combined,
-                            hidden_states_sf,
-                        )
-
-                    if "token_top_ks" in extra_tensors_combined:
-                        token_top_ks = extra_tensors_combined["token_top_ks"]
-                else:
-                    hidden_states_combined, router_logits = dispatch_res
-                    orig_hidden_states = hidden_states_combined
+                if "token_top_ks" in extra_tensors_combined:
+                    token_top_ks = extra_tensors_combined["token_top_ks"]
             else:
                 orig_hidden_states = hidden_states
 
