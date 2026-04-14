@@ -53,7 +53,7 @@ from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
     compute_new_slot_mapping,
     copy_and_expand_eagle_inputs_kernel,
-    calc_perplexity,
+    calc_distribution_perplexity,
     eagle_prepare_inputs_padded_kernel,
     eagle_prepare_next_token_padded_kernel,
     extend_all_queries_by_N,
@@ -507,8 +507,8 @@ class SpecDecodeBaseProposer:
             f"but got {logits.device.type}."
         )
 
-        ppls = calc_perplexity(logits, token_ids)
-        
+        ppls = calc_distribution_perplexity(logits)
+
         # Report PPLs to dump manager if enabled
         if self.ppl_dump_manager is not None:
             self.ppl_dump_manager.add_token_ppls(ppls)
