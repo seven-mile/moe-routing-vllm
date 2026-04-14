@@ -155,7 +155,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
-from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.eagle import EagleProposer, FusedTopKActionTensors
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
@@ -922,6 +922,9 @@ class GPUModelRunner(
         # that they get cleared from the persistent batch before being re-scheduled
         # in the normal resumed request path.
         unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
+        scheduled_action_cfgs = (
+            scheduler_output.scheduled_req_dyn_assisted_action_configs
+        )
         # NOTE(woosuk): The persistent batch optimization assumes that
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
@@ -936,6 +939,9 @@ class GPUModelRunner(
             if req_id in self.requests:
                 # For streaming case only.
                 req_state = self._update_streaming_request(req_id, new_req_data)
+                req_state.dyn_assisted_action_config_str = scheduled_action_cfgs.get(
+                    req_id, "null"
+                )
                 reqs_to_add.append(req_state)
                 continue
 
@@ -972,6 +978,7 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                dyn_assisted_action_config_str=scheduled_action_cfgs.get(req_id, "null"),
             )
             self.requests[req_id] = req_state
 
@@ -1004,6 +1011,9 @@ class GPUModelRunner(
 
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
+            req_state.dyn_assisted_action_config_str = scheduled_action_cfgs.get(
+                req_id, "null"
+            )
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
@@ -1098,6 +1108,10 @@ class GPUModelRunner(
 
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
+            if self.input_batch._dyn_action is not None:
+                self.input_batch.update_dyn_assisted_action(
+                    req_index, req_state.dyn_assisted_action_config_str
+                )
             if new_block_ids is not None:
                 self.input_batch.block_table.append_row(new_block_ids, req_index)
 
@@ -1132,6 +1146,7 @@ class GPUModelRunner(
         self._may_reorder_batch(scheduler_output)
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
+        self.input_batch.sync_dyn_assisted_action_to_gpu(self.input_batch.num_reqs)
 
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
@@ -4177,14 +4192,20 @@ class GPUModelRunner(
                 slot_mappings=slot_mappings,
             )
 
-            actions = scheduler_output.scheduled_req_dyn_assisted_action_configs
-            actions = [actions[req_id] for req_id in self.input_batch.req_ids]
+            num_reqs = self.input_batch.num_reqs
+            dyn_action = self.input_batch.dyn_action
+            action_tensors = FusedTopKActionTensors(
+                cfg_boundaries=dyn_action.cfg_boundaries[:num_reqs],
+                layer_mask=dyn_action.layer_mask[:num_reqs],
+            )
 
             # NOTE(seven-mile): The shape changes here.
             # draft_token_logits: gamma token logits
             # draft_token_top_ks: 1+gamma token topks
             draft_token_top_ks = self.drafter.get_token_top_ks_from_proposals(
-                draft_token_ids, draft_token_logits, actions,
+                draft_token_ids,
+                draft_token_logits,
+                action_tensors=action_tensors,
             )
 
         return draft_token_ids, draft_token_top_ks

@@ -5,6 +5,7 @@ import json
 import os
 import threading
 import time
+from dataclasses import dataclass
 from dataclasses import replace
 from importlib.util import find_spec
 from typing import cast
@@ -33,7 +34,6 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.triton_utils import triton
 from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.utils.udf import UserDefinedFunctionConfig, load_user_defined_function
 from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
@@ -49,6 +49,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.fused_kernel import fused_logits_to_total_topk
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
     compute_new_slot_mapping,
@@ -63,6 +64,12 @@ from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class FusedTopKActionTensors:
+    cfg_boundaries: torch.Tensor
+    layer_mask: torch.Tensor
 
 
 class PPLDumpManager:
@@ -477,25 +484,28 @@ class SpecDecodeBaseProposer:
         self,
         token_ids: torch.Tensor,
         logits: torch.Tensor,
-        assisted_action_configs: list[str],
+        action_tensors: FusedTopKActionTensors | None = None,
     ) -> torch.Tensor:
-        """Get token top-k values from proposal probabilities.
+        """Get proposal token top-k tensor from draft logits.
 
         Args:
-            proposals: SpeculativeProposals object containing proposal probabilities.
+            token_ids: Proposal token ids with shape [B, S].
+            logits: Proposal logits with shape [B, S, V].
+            action_tensors: Per-request fused action tensors used by the
+                dynamic top-k kernel.
+
         Returns:
-            A tensor of shape (batch_size, max_proposal_len) containing the top-k
-            values for each token in the proposals.
+            Tensor with shape [B, S + 1, L], where the trailing "+1" slot is
+            reserved for the next-token routing hint.
         """
         model_config = self.vllm_config.model_config
-        batch_size, spec_len = token_ids.shape
+        batch_size, _ = token_ids.shape
         
         base_top_k = model_config.get_num_experts_per_token()
         target_model = self.runner.get_model()
         assert is_mixture_of_experts(target_model), (
             "The model must be a mixture of experts model.")
-        num_layers = target_model.num_moe_layers
-        assert num_layers > 0, "No MoE layers found in the model."
+        assert target_model.num_moe_layers > 0, "No MoE layers found in the model."
 
         # Assert input tensors are on-device.
         assert token_ids.device.type == self.device.type, (
@@ -507,39 +517,28 @@ class SpecDecodeBaseProposer:
             f"but got {logits.device.type}."
         )
 
-        ppls = calc_distribution_perplexity(logits)
-
-        # Report PPLs to dump manager if enabled
-        if self.ppl_dump_manager is not None:
-            self.ppl_dump_manager.add_token_ppls(ppls)
-
-        total_topks = torch.full(
-            (num_layers, batch_size, spec_len+1),
-            base_top_k,
-            device=self.device,
+        assert action_tensors is not None, (
+            "Missing dyn action tensors; fallback path has been removed."
         )
 
-        assert len(assisted_action_configs) == batch_size, \
-            f"Expected {batch_size} assisted action configs, " \
-            f"but got {len(assisted_action_configs)}"
+        cfg_boundaries = action_tensors.cfg_boundaries
+        layer_mask = action_tensors.layer_mask
+        assert cfg_boundaries.shape[0] == batch_size
+        assert layer_mask.shape[0] == batch_size
 
-        for req_idx, action_cfg in enumerate(assisted_action_configs):
-            action_cfg = UserDefinedFunctionConfig.loads(action_cfg)
-            if action_cfg is None:
-                continue
-            action = load_user_defined_function(action_cfg)
-            with torch.device(self.device):
-                spec_topks = action(ppls[req_idx], model_config.hf_config)
-                # The output token guides the top-k of the input token.
-                total_topks[:, req_idx, :-1] = spec_topks
-                # The last token's top-k is determined by the mean k.
-                if envs.VLLM_DYN_TOPK_APPLY_LAST_TOKEN:
-                    last_topks = torch.mean(spec_topks, dim=-1, dtype=torch.float32)
-                    total_topks[:, req_idx, -1] = last_topks
+        total_topks = fused_logits_to_total_topk(
+            logits=logits,
+            cfg_boundaries=cfg_boundaries,
+            layer_mask=layer_mask,
+            base_k=base_top_k,
+            apply_last_token=envs.VLLM_DYN_TOPK_APPLY_LAST_TOKEN,
+        )
 
-        # Swap num_layers to inner dim for better input organization.
-        total_topks = total_topks.permute(1, 2, 0).contiguous()
-        return total_topks
+        if self.ppl_dump_manager is not None:
+            ppls = calc_distribution_perplexity(logits)
+            self.ppl_dump_manager.add_token_ppls(ppls)
+
+        return total_topks.contiguous()
 
     def propose(
         self,
