@@ -176,6 +176,8 @@ class BenchmarkMetrics:
     request_throughput: float
     request_goodput: float
     output_throughput: float
+    pure_decode_duration_s: float
+    pure_decode_output_throughput: float
     total_token_throughput: float
     mean_ttft_ms: float
     median_ttft_ms: float
@@ -495,6 +497,10 @@ def calculate_metrics(
             stacklevel=2,
         )
 
+    total_output = sum(actual_output_lens)
+    pure_decode_duration_s = 0.0
+    pure_decode_output_throughput = 0.0
+
     # Calculate max output tokens per second metric
     max_output_tokens_per_s = 0.0
     max_concurrent_requests = 0
@@ -507,6 +513,20 @@ def calculate_metrics(
         print("Failed requests during benchmark run detected (capping to 10):")
         for i, err in enumerate(failed_outputs[:10]):
             print(f"Error {i}: {err.error}")
+
+    if successful_outputs:
+        pure_decode_start_time = max(
+            output.start_time + output.ttft for output in successful_outputs
+        )
+        pure_decode_end_time = max(
+            output.start_time + output.latency for output in successful_outputs
+        )
+        pure_decode_duration_s = max(
+            pure_decode_end_time - pure_decode_start_time,
+            0.0,
+        )
+        if pure_decode_duration_s > 0.0:
+            pure_decode_output_throughput = total_output / pure_decode_duration_s
 
     if successful_outputs:
         min_start_time = min(output.start_time for output in successful_outputs)
@@ -571,11 +591,13 @@ def calculate_metrics(
         completed=completed,
         failed=len(failed_outputs),
         total_input=total_input,
-        total_output=sum(actual_output_lens),
+        total_output=total_output,
         request_throughput=completed / dur_s,
         request_goodput=good_completed / dur_s,
-        output_throughput=sum(actual_output_lens) / dur_s,
-        total_token_throughput=(total_input + sum(actual_output_lens)) / dur_s,
+        output_throughput=total_output / dur_s,
+        pure_decode_duration_s=pure_decode_duration_s,
+        pure_decode_output_throughput=pure_decode_output_throughput,
+        total_token_throughput=(total_input + total_output) / dur_s,
         mean_ttft_ms=np.mean(ttfts or 0)
         * 1000,  # ttfts is empty if streaming is not supported by the endpoint
         std_ttft_ms=np.std(ttfts or 0) * 1000,
@@ -980,6 +1002,22 @@ async def benchmark(
                 "Peak concurrent requests:", metrics.max_concurrent_requests
             )
         )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Pure Decode duration (s):", metrics.pure_decode_duration_s
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Pure Decode output throughput (tok/s):",
+                metrics.pure_decode_output_throughput,
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Peak output token throughput (tok/s):", metrics.max_output_tokens_per_s
+            )
+        )
         if metrics.rtfx > 0.0:
             print(
                 "{:<40} {:<10.2f}".format(
@@ -1003,6 +1041,8 @@ async def benchmark(
             "request_throughput": metrics.request_throughput,
             "request_goodput": metrics.request_goodput if goodput_config_dict else None,
             "output_throughput": metrics.output_throughput,
+            "pure_decode_duration": metrics.pure_decode_duration_s,
+            "pure_decode_output_throughput": metrics.pure_decode_output_throughput,
             "total_token_throughput": metrics.total_token_throughput,
             "input_lens": [output.prompt_len for output in outputs],
             "output_lens": actual_output_lens,
