@@ -94,8 +94,13 @@ class CachedRequestState:
 class DynAssistedActionState:
     cfg_boundaries: torch.Tensor
     layer_mask: torch.Tensor
+    has_vectorized_action_cpu_tensor: torch.Tensor
     cfg_boundaries_cpu_tensor: torch.Tensor
     layer_mask_cpu_tensor: torch.Tensor
+
+    @property
+    def has_vectorized_action(self) -> bool:
+        return bool(torch.any(self.has_vectorized_action_cpu_tensor).item())
 
     def sync_to_gpu(self, num_reqs: int) -> None:
         self.cfg_boundaries[:num_reqs].copy_(
@@ -113,10 +118,17 @@ class DynAssistedActionState:
     ) -> tuple[bool, list[float], list[int]]:
         cfg = UserDefinedFunctionConfig.loads(action_config_str)
         if cfg is None:
-            return False, [], [0, 0, 1]
+            return False, [], [0, 1000, 1]
+
+        if cfg.function == "baseline":
+            return False, [], [0, 1000, 1]
 
         if cfg.function != "spec_with_list_layer_range":
-            return False, [], [0, 0, 1]
+            raise ValueError(
+                "Unsupported dyn_assisted_action_config function "
+                f"{cfg.function!r}; expected 'spec_with_list_layer_range', "
+                "'baseline', or null."
+            )
 
         args = tuple(cfg.args or ())
         kwargs = dict(cfg.kwargs or ())
@@ -125,7 +137,10 @@ class DynAssistedActionState:
         layer_range = kwargs.get("layer_range", args[1] if len(args) >= 2 else None)
 
         if cfg_vals is None:
-            return False, [], [0, 0, 1]
+            raise ValueError(
+                "spec_with_list_layer_range dyn_assisted_action_config "
+                "requires cfg values."
+            )
 
         cfg_list = [float(x) for x in cfg_vals]
         if layer_range is None:
@@ -135,7 +150,10 @@ class DynAssistedActionState:
             if len(layer_range_list) == 2:
                 layer_range_list.append(1)
             elif len(layer_range_list) != 3:
-                return False, [], [0, 0, 1]
+                raise ValueError(
+                    "spec_with_list_layer_range layer_range must contain "
+                    "2 or 3 integers."
+                )
 
         return True, cfg_list, layer_range_list
 
@@ -147,14 +165,11 @@ class DynAssistedActionState:
         is_vec, cfg_vals, layer_range = self._extract_vectorized_action_params(
             action_config_str
         )
-        assert is_vec, (
-            "Only vectorized assisted_action config is supported; "
-            "fallback path has been removed."
-        )
 
         cfg_width = self.cfg_boundaries_cpu_tensor.shape[1]
         num_layers = self.layer_mask_cpu_tensor.shape[1]
 
+        self.has_vectorized_action_cpu_tensor[req_index] = is_vec
         self.cfg_boundaries_cpu_tensor[req_index].fill_(0.0)
         self.layer_mask_cpu_tensor[req_index].fill_(False)
 
@@ -411,6 +426,12 @@ class InputBatch:
                 dtype=torch.bool,
                 device=self.device,
             ),
+            has_vectorized_action_cpu_tensor=torch.zeros(
+                (self.max_num_reqs,),
+                dtype=torch.bool,
+                device="cpu",
+                pin_memory=False,
+            ),
             cfg_boundaries_cpu_tensor=torch.zeros(
                 (self.max_num_reqs, int(base_top_k)),
                 dtype=torch.float32,
@@ -432,6 +453,8 @@ class InputBatch:
 
     def sync_dyn_assisted_action_to_gpu(self, num_reqs: int) -> None:
         if self._dyn_action is None:
+            return
+        if not self.dyn_action.has_vectorized_action:
             return
         self.dyn_action.sync_to_gpu(num_reqs)
 
@@ -688,6 +711,7 @@ class InputBatch:
 
         if self._dyn_action is not None:
             dyn_action = self.dyn_action
+            dyn_action.has_vectorized_action_cpu_tensor[req_index] = False
             dyn_action.cfg_boundaries_cpu_tensor[req_index].fill_(0.0)
             dyn_action.layer_mask_cpu_tensor[req_index].fill_(False)
 
@@ -777,6 +801,13 @@ class InputBatch:
             ) = (
                 dyn_action.layer_mask_cpu_tensor[i2].clone(),
                 dyn_action.layer_mask_cpu_tensor[i1].clone(),
+            )
+            (
+                dyn_action.has_vectorized_action_cpu_tensor[i1],
+                dyn_action.has_vectorized_action_cpu_tensor[i2],
+            ) = (
+                dyn_action.has_vectorized_action_cpu_tensor[i2].clone(),
+                dyn_action.has_vectorized_action_cpu_tensor[i1].clone(),
             )
 
         # NOTE: the following is unsafe
@@ -944,6 +975,10 @@ class InputBatch:
                     dyn_action.layer_mask_cpu_tensor[last_req_index]
                 )
                 dyn_action.layer_mask_cpu_tensor[last_req_index].fill_(False)
+                dyn_action.has_vectorized_action_cpu_tensor[empty_index] = (
+                    dyn_action.has_vectorized_action_cpu_tensor[last_req_index]
+                )
+                dyn_action.has_vectorized_action_cpu_tensor[last_req_index] = False
             self.block_table.move_row(last_req_index, empty_index)
 
             self.request_lora_mapping[empty_index] = self.request_lora_mapping[

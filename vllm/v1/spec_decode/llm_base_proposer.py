@@ -752,9 +752,18 @@ class SpecDecodeBaseProposer:
             f"Expected logits to be on device {self.device.type}, "
             f"but got {logits.device.type}."
         )
-        assert action_tensors is not None, (
-            "Missing dyn action tensors; fallback path has been removed."
-        )
+        if self.ppl_dump_manager is not None:
+            ppls = calc_distribution_perplexity(logits)
+            self.ppl_dump_manager.add_token_ppls(ppls)
+
+        if action_tensors is None:
+            num_moe_layers = target_model.num_moe_layers
+            return torch.full(
+                (batch_size, logits.shape[1] + 1, num_moe_layers),
+                base_top_k,
+                dtype=torch.int32,
+                device=logits.device,
+            )
 
         cfg_boundaries = action_tensors.cfg_boundaries
         layer_mask = action_tensors.layer_mask
@@ -768,10 +777,6 @@ class SpecDecodeBaseProposer:
             base_k=base_top_k,
             apply_last_token=envs.VLLM_DYN_TOPK_APPLY_LAST_TOKEN,
         )
-
-        if self.ppl_dump_manager is not None:
-            ppls = calc_distribution_perplexity(logits)
-            self.ppl_dump_manager.add_token_ppls(ppls)
 
         return total_topks.contiguous()
 
