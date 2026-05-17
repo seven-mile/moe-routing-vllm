@@ -5230,10 +5230,12 @@ class GPUModelRunner(
 
             num_reqs = self.input_batch.num_reqs
             dyn_action = self.input_batch.dyn_action
-            action_tensors = FusedTopKActionTensors(
-                cfg_boundaries=dyn_action.cfg_boundaries[:num_reqs],
-                layer_mask=dyn_action.layer_mask[:num_reqs],
-            )
+            action_tensors = None
+            if dyn_action.has_vectorized_action:
+                action_tensors = FusedTopKActionTensors(
+                    cfg_boundaries=dyn_action.cfg_boundaries[:num_reqs],
+                    layer_mask=dyn_action.layer_mask[:num_reqs],
+                )
 
             # NOTE(seven-mile): The shape changes here.
             # draft_token_logits: gamma token logits

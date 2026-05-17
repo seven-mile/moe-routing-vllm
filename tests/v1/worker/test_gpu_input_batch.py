@@ -11,12 +11,17 @@ import torch
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.utils.torch_utils import make_tensor_with_pad
+from vllm.utils.udf import UserDefinedFunctionConfig
 from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.block_table import BlockTable, MultiGroupBlockTable
-from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+from vllm.v1.worker.gpu_input_batch import (
+    CachedRequestState,
+    DynAssistedActionState,
+    InputBatch,
+)
 
 VOCAB_SIZE = 1024
 NUM_OUTPUT_TOKENS = 20
@@ -24,6 +29,73 @@ MAX_PROMPT_SIZE = 100
 DEVICE_TYPE = current_platform.device_type
 DEVICES = [f"{DEVICE_TYPE}:{i}" for i in range(min(current_platform.device_count(), 2))]
 MAX_NUM_PROMPT_TOKENS = 64
+
+
+def _udf_config(function: str, args=None, kwargs=None) -> str:
+    return UserDefinedFunctionConfig(
+        file="test_actions.py",
+        function=function,
+        args=tuple(args) if args is not None else None,
+        kwargs=tuple(sorted(kwargs.items())) if kwargs is not None else None,
+    ).dumps()
+
+
+def test_dyn_assisted_action_config_parsing():
+    assert DynAssistedActionState._extract_vectorized_action_params("null") == (
+        False,
+        [],
+        [0, 1000, 1],
+    )
+    assert DynAssistedActionState._extract_vectorized_action_params(
+        _udf_config("baseline")
+    ) == (False, [], [0, 1000, 1])
+
+    assert DynAssistedActionState._extract_vectorized_action_params(
+        _udf_config(
+            "spec_with_list_layer_range",
+            kwargs={"cfg": [0.1, 0.2], "layer_range": [1, 4]},
+        )
+    ) == (True, [0.1, 0.2], [1, 4, 1])
+
+    with pytest.raises(ValueError, match="Unsupported dyn_assisted_action_config"):
+        DynAssistedActionState._extract_vectorized_action_params(
+            _udf_config("custom_action")
+        )
+
+
+def test_dyn_assisted_action_state_tracks_batch_vectorization():
+    state = DynAssistedActionState(
+        cfg_boundaries=torch.zeros((3, 4), dtype=torch.float32),
+        layer_mask=torch.zeros((3, 6), dtype=torch.bool),
+        has_vectorized_action_cpu_tensor=torch.zeros(3, dtype=torch.bool),
+        cfg_boundaries_cpu_tensor=torch.zeros((3, 4), dtype=torch.float32),
+        layer_mask_cpu_tensor=torch.zeros((3, 6), dtype=torch.bool),
+    )
+
+    state.update_from_config(0, "null")
+    state.update_from_config(1, _udf_config("baseline"))
+    assert not state.has_vectorized_action
+    assert torch.all(state.layer_mask_cpu_tensor[0])
+    assert torch.all(state.layer_mask_cpu_tensor[1])
+
+    state.update_from_config(
+        2,
+        _udf_config(
+            "spec_with_list_layer_range",
+            args=([0.25, 0.5, 0.75], [1, 5, 2]),
+        ),
+    )
+    assert state.has_vectorized_action
+    assert state.has_vectorized_action_cpu_tensor.tolist() == [False, False, True]
+    assert state.cfg_boundaries_cpu_tensor[2].tolist() == [0.0, 0.75, 0.5, 0.25]
+    assert state.layer_mask_cpu_tensor[2].tolist() == [
+        False,
+        True,
+        False,
+        True,
+        False,
+        False,
+    ]
 
 
 def _compare_objs(obj1, obj2, skip: Sequence = ("logitsprocs", "batch_update_builder")):
