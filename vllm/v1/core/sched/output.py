@@ -252,6 +252,8 @@ class SchedulerOutput:
             num_scheduled_tokens={},
             total_num_scheduled_tokens=0,
             scheduled_spec_decode_tokens={},
+            scheduled_spec_decode_token_top_ks={},
+            scheduled_req_dyn_assisted_action_configs={},
             scheduled_encoder_inputs={},
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
