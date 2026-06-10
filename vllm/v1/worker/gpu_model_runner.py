@@ -4657,6 +4657,15 @@ class GPUModelRunner(
                 self._draft_token_ids = torch.zeros(
                     1, device=self.device, dtype=torch.int32
                 ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
+                target_model = self.get_model()
+                assert is_mixture_of_experts(target_model), (
+                    "The model must be a mixture of experts model."
+                )
+                self._draft_token_top_ks = torch.full(
+                    (len(self.input_batch.req_ids), self.num_spec_tokens, target_model.num_moe_layers),
+                    self.model_config.get_num_experts_per_token(),
+                    device=self.device, dtype=torch.int32,
+                )
                 self._draft_probs = None
                 self._draft_prob_req_ids = None
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
