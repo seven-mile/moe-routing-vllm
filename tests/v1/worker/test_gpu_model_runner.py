@@ -45,18 +45,91 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu.lora_utils import LoraState
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu_input_batch import InputBatch
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.worker.utils import select_common_block_size
+from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, GPUModelRunner
+from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 BLOCK_SIZE = 16
 NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
+
+
+class _DummyEvent:
+
+    def synchronize(self):
+        pass
+
+
+def test_async_gpu_model_runner_output_preserves_token_top_ks():
+    output = AsyncGPUModelRunnerOutput.__new__(AsyncGPUModelRunnerOutput)
+    output._model_runner_output = ModelRunnerOutput(
+        req_ids=["req0", "req1"],
+        req_id_to_index={"req0": 0, "req1": 1},
+    )
+    output._invalid_req_indices = [1]
+    output.async_copy_ready_event = _DummyEvent()
+    output.sampled_token_ids_cpu = torch.tensor(
+        [[10], [20]],
+        dtype=torch.int32,
+    )
+    output._logprobs_tensors_cpu = None
+    output._sampled_token_top_ks_cpu = None
+    output._next_draft_first_token_top_ks_cpu = torch.tensor(
+        [[[7, 8]], [[8, 8]]],
+        dtype=torch.int32,
+    )
+    output._routed_experts_cpu = None
+    output._logprobs_tensors = None
+    output._sampled_token_ids = None
+    output._sampled_token_top_ks = None
+    output._next_draft_first_token_top_ks = None
+    output._routed_experts = None
+
+    parsed = output.get_output()
+
+    assert parsed.sampled_token_ids == [[10], []]
+    assert parsed.token_top_ks == [[[7, 8]], []]
+
+
+def test_async_gpu_model_runner_output_preserves_spec_token_top_ks():
+    output = AsyncGPUModelRunnerOutput.__new__(AsyncGPUModelRunnerOutput)
+    output._model_runner_output = ModelRunnerOutput(
+        req_ids=["req0"],
+        req_id_to_index={"req0": 0},
+    )
+    output._invalid_req_indices = []
+    output.async_copy_ready_event = _DummyEvent()
+    output.sampled_token_ids_cpu = torch.tensor(
+        [[30, -1, -1]],
+        dtype=torch.int32,
+    )
+    output.vocab_size = 1024
+    output._logprobs_tensors_cpu = None
+    output._sampled_token_top_ks_cpu = torch.tensor(
+        [[[8, 8], [3, 3], [8, 8]]],
+        dtype=torch.int32,
+    )
+    output._next_draft_first_token_top_ks_cpu = torch.tensor(
+        [[[6, 6]]],
+        dtype=torch.int32,
+    )
+    output._routed_experts_cpu = None
+    output._logprobs_tensors = None
+    output._sampled_token_ids = None
+    output._sampled_token_top_ks = None
+    output._next_draft_first_token_top_ks = None
+    output._routed_experts = None
+
+    parsed = output.get_output()
+
+    assert parsed.sampled_token_ids == [[30]]
+    assert parsed.token_top_ks == [[[6, 6]]]
 
 
 def initialize_kv_cache(runner: GPUModelRunner):

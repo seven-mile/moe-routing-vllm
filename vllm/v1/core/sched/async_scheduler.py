@@ -15,6 +15,22 @@ class AsyncScheduler(Scheduler):
         # reusable read-only placeholder list for speculative decoding.
         self._spec_token_placeholders: list[int] = [-1] * self.num_spec_tokens
         self.pp_size = self.parallel_config.pipeline_parallel_size
+        hf_config = self.vllm_config.model_config.hf_text_config
+        base_top_k = int(
+            getattr(hf_config, "num_experts_per_tok", 0)
+            or getattr(hf_config, "moe_top_k", 0)
+            or 0
+        )
+        num_moe_layers = (
+            int(getattr(hf_config, "num_hidden_layers", 0))
+            - int(getattr(hf_config, "first_k_dense_replace", 0))
+            if base_top_k > 0
+            else 0
+        )
+        self._spec_token_top_k_placeholders: list[list[int]] = [
+            [base_top_k] * num_moe_layers
+            for _ in range(self.num_spec_tokens + 1)
+        ]
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)
@@ -23,6 +39,9 @@ class AsyncScheduler(Scheduler):
         self._spec_token_placeholders = [
             -1
         ] * scheduler_output.num_spec_tokens_to_schedule
+        spec_decode_token_top_ks = (
+            scheduler_output.scheduled_spec_decode_token_top_ks
+        )
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
             if request.is_prefill_chunk:
@@ -39,9 +58,21 @@ class AsyncScheduler(Scheduler):
             request.num_output_placeholders += (
                 self.num_sampled_tokens_per_step + cur_num_spec_tokens
             )
+            if (
+                cur_num_spec_tokens
+                and self._spec_token_top_k_placeholders
+                and req_id not in spec_decode_token_top_ks
+            ):
+                spec_decode_token_top_ks[req_id] = (
+                    self._spec_token_top_k_placeholders[: cur_num_spec_tokens + 1]
+                )
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
             request.spec_token_ids = self._spec_token_placeholders
+            if self._spec_token_top_k_placeholders:
+                request.spec_token_top_ks = self._spec_token_top_k_placeholders[
+                    : cur_num_spec_tokens + 1
+                ]
 
             if self.use_v2_model_runner:
                 # Set the next step index in which this request is eligible to be
