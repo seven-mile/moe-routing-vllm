@@ -14,10 +14,29 @@ class AsyncScheduler(Scheduler):
         super().__init__(*args, **kwargs)
         # reusable read-only placeholder list for speculative decoding.
         self._spec_token_placeholders: list[int] = [-1] * self.num_spec_tokens
+        hf_config = self.vllm_config.model_config.hf_text_config
+        base_top_k = int(
+            getattr(hf_config, "num_experts_per_tok", 0)
+            or getattr(hf_config, "moe_top_k", 0)
+            or 0
+        )
+        num_moe_layers = (
+            int(getattr(hf_config, "num_hidden_layers", 0))
+            - int(getattr(hf_config, "first_k_dense_replace", 0))
+            if base_top_k > 0
+            else 0
+        )
+        self._spec_token_top_k_placeholders: list[list[int]] = [
+            [base_top_k] * num_moe_layers
+            for _ in range(self.num_spec_tokens + 1)
+        ]
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+        spec_decode_token_top_ks = (
+            scheduler_output.scheduled_spec_decode_token_top_ks
+        )
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
             if request.is_prefill_chunk:
@@ -29,10 +48,20 @@ class AsyncScheduler(Scheduler):
             # The request will generate a new token plus num_spec_tokens
             # in this scheduling step.
             cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
+            if (
+                cur_num_spec_tokens
+                and self._spec_token_top_k_placeholders
+                and req_id not in spec_decode_token_top_ks
+            ):
+                spec_decode_token_top_ks[req_id] = (
+                    self._spec_token_top_k_placeholders[: cur_num_spec_tokens + 1]
+                )
             request.num_output_placeholders += 1 + cur_num_spec_tokens
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
             request.spec_token_ids = self._spec_token_placeholders
+            if self._spec_token_top_k_placeholders:
+                request.spec_token_top_ks = self._spec_token_top_k_placeholders
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]
