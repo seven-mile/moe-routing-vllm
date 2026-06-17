@@ -3702,13 +3702,8 @@ class GPUModelRunner(
         sampled_token_ids = sampler_output.sampled_token_ids
         logprobs_tensors = sampler_output.logprobs_tensors
         sampled_token_top_ks = sampler_output.sampled_token_top_ks
-        next_draft_first_token_top_ks = (
-            self._draft_token_top_ks[:, 0:]
-            if self._draft_token_top_ks is not None
-            else torch.tensor([
-                [[8 for _ in range(self.model.num_moe_layers)]]
-                for _ in range(num_sampled_tokens)
-            ], device='cpu')
+        next_draft_first_token_top_ks = self._get_next_draft_first_token_top_ks(
+            num_sampled_tokens, sampled_token_ids.device
         )
         invalid_req_indices = []
         logprobs_lists = None
@@ -3740,7 +3735,11 @@ class GPUModelRunner(
                 if logprobs_tensors is not None:
                     logprobs_lists = logprobs_tensors.tolists()
 
-                valid_token_top_ks = next_draft_first_token_top_ks.tolist()
+                valid_token_top_ks = (
+                    next_draft_first_token_top_ks.tolist()
+                    if next_draft_first_token_top_ks is not None
+                    else []
+                )
             else:
                 # Includes spec decode tokens.
                 # All input tokens for decode phase are to sample.
@@ -4662,7 +4661,11 @@ class GPUModelRunner(
                     "The model must be a mixture of experts model."
                 )
                 self._draft_token_top_ks = torch.full(
-                    (len(self.input_batch.req_ids), self.num_spec_tokens, target_model.num_moe_layers),
+                    (
+                        len(self.input_batch.req_ids),
+                        self.num_spec_tokens + 1,
+                        target_model.num_moe_layers,
+                    ),
                     self.model_config.get_num_experts_per_token(),
                     device=self.device, dtype=torch.int32,
                 )
@@ -4781,6 +4784,27 @@ class GPUModelRunner(
             )
 
         return async_output
+
+    def _get_next_draft_first_token_top_ks(
+        self, num_sampled_tokens: int, device: torch.device
+    ) -> torch.Tensor | None:
+        if self._draft_token_top_ks is not None:
+            return self._draft_token_top_ks[:, :1]
+
+        num_moe_layers = int(getattr(self.model, "num_moe_layers", 0) or 0)
+        if num_moe_layers <= 0:
+            return None
+
+        base_top_k = self.model_config.get_num_experts_per_token()
+        if base_top_k is None:
+            return None
+
+        return torch.full(
+            (num_sampled_tokens, 1, num_moe_layers),
+            base_top_k,
+            dtype=torch.int32,
+            device=device,
+        )
 
     def _pp_broadcast_prev_sampled_token_ids(
         self, sampled_token_ids: torch.Tensor

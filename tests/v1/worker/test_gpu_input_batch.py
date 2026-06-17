@@ -27,7 +27,16 @@ VOCAB_SIZE = 1024
 NUM_OUTPUT_TOKENS = 20
 MAX_PROMPT_SIZE = 100
 DEVICE_TYPE = current_platform.device_type
-DEVICES = [f"{DEVICE_TYPE}:{i}" for i in range(min(current_platform.device_count(), 2))]
+DEVICE_COUNT = (
+    current_platform.device_count()
+    if current_platform.device_count is not None
+    else 0
+)
+DEVICES = (
+    [f"{DEVICE_TYPE}:{i}" for i in range(min(DEVICE_COUNT, 2))]
+    if DEVICE_COUNT
+    else ["cpu"]
+)
 MAX_NUM_PROMPT_TOKENS = 64
 
 
@@ -286,6 +295,119 @@ def _construct_cached_request_state(req_id_suffix: int):
         num_computed_tokens=len(output_token_ids),
         output_token_ids=output_token_ids,
     )
+
+
+def _make_cached_request(
+    req_id: str,
+    prompt_token_ids: list[int],
+    output_token_ids: list[int] | None = None,
+    dyn_assisted_action_config_str: str = "null",
+) -> CachedRequestState:
+    return CachedRequestState(
+        req_id=req_id,
+        prompt_token_ids=prompt_token_ids,
+        sampling_params=SamplingParams(),
+        pooling_params=None,
+        mm_features=[],
+        block_ids=([],),
+        generator=None,
+        num_computed_tokens=0,
+        output_token_ids=output_token_ids or [],
+        dyn_assisted_action_config_str=dyn_assisted_action_config_str,
+    )
+
+
+def _make_input_batch_with_topks(max_num_reqs: int = 4) -> InputBatch:
+    input_batch = InputBatch(
+        max_num_reqs=max_num_reqs,
+        max_model_len=16,
+        max_num_batched_tokens=16,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[1],
+        kernel_block_sizes=[1],
+    )
+    input_batch.initialize_token_top_ks(num_moe_layers=3, base_top_k=8)
+    return input_batch
+
+
+def test_token_top_ks_reset_when_request_slot_reused():
+    input_batch = _make_input_batch_with_topks(max_num_reqs=1)
+    dynamic_req = _make_cached_request(
+        "dynamic",
+        [10, 11],
+        dyn_assisted_action_config_str=_udf_config(
+            "spec_with_list_layer_range",
+            args=([6.0, 1.0], [0, 0]),
+        ),
+    )
+
+    input_batch.add_request(dynamic_req)
+    input_batch.update_req_spec_token_ids(
+        dynamic_req,
+        scheduled_spec_tokens={"dynamic": [12]},
+        scheduled_spec_token_top_ks={
+            "dynamic": [[3, 4, 5], [2, 2, 2]],
+        },
+    )
+    assert input_batch.token_top_ks_cpu_tensor[0, :3].tolist() == [
+        [8, 8, 8],
+        [3, 4, 5],
+        [2, 2, 2],
+    ]
+
+    input_batch.remove_request("dynamic")
+    baseline_req = _make_cached_request("baseline", [20, 21, 22])
+    assigned_index = input_batch.add_request(baseline_req)
+
+    assert assigned_index == 0
+    assert input_batch.token_top_ks_cpu_tensor[0, :3].tolist() == [
+        [8, 8, 8],
+        [8, 8, 8],
+        [8, 8, 8],
+    ]
+    assert not input_batch.dyn_action.has_vectorized_action_cpu_tensor[0]
+
+
+def test_token_top_ks_move_with_swap_and_condense():
+    input_batch = _make_input_batch_with_topks(max_num_reqs=3)
+    req0 = _make_cached_request("req0", [1, 2])
+    req1 = _make_cached_request("req1", [3, 4, 5])
+    req2 = _make_cached_request("req2", [6, 7, 8, 9])
+
+    input_batch.add_request(req0)
+    input_batch.add_request(req1)
+    input_batch.add_request(req2)
+
+    req0_topks = torch.tensor([[1, 1, 1], [2, 2, 2]], dtype=torch.int32)
+    req1_topks = torch.tensor([[3, 3, 3], [4, 4, 4], [5, 5, 5]], dtype=torch.int32)
+    req2_topks = torch.tensor(
+        [[6, 6, 6], [7, 7, 7], [6, 7, 8], [8, 8, 8]],
+        dtype=torch.int32,
+    )
+    input_batch.set_token_top_ks(0, 0, req0_topks, len(req0_topks))
+    input_batch.set_token_top_ks(1, 0, req1_topks, len(req1_topks))
+    input_batch.set_token_top_ks(2, 0, req2_topks, len(req2_topks))
+
+    input_batch.swap_states(0, 1)
+    assert input_batch.req_ids[:3] == ["req1", "req0", "req2"]
+    assert torch.equal(input_batch.token_top_ks_cpu_tensor[0, :3], req1_topks)
+    assert torch.equal(input_batch.token_top_ks_cpu_tensor[1, :2], req0_topks)
+
+    input_batch.remove_request("req1")
+    input_batch.condense()
+
+    assert input_batch.req_ids[:2] == ["req2", "req0"]
+    assert input_batch.req_id_to_index["req2"] == 0
+    assert torch.equal(input_batch.token_top_ks_cpu_tensor[0, :4], req2_topks)
+    assert torch.equal(input_batch.token_top_ks_cpu_tensor[1, :2], req0_topks)
+    assert input_batch.token_top_ks_cpu_tensor[2, :4].tolist() == [
+        [8, 8, 8],
+        [8, 8, 8],
+        [8, 8, 8],
+        [8, 8, 8],
+    ]
 
 
 @pytest.mark.parametrize("device", DEVICES)
