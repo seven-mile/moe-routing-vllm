@@ -3,7 +3,7 @@
 # Datastructures defining a GPU input batch
 
 from dataclasses import dataclass
-from typing import cast
+from typing import Sequence, cast
 
 import numpy as np
 import torch
@@ -244,6 +244,7 @@ class InputBatch:
         )
         self.is_token_ids = self.is_token_ids_tensor.numpy()
         self.token_top_ks_cpu_tensor: torch.Tensor | None = None
+        self.token_top_ks_base_value: int | None = None
         # Store prompt embeddings per request to avoid OOM from large upfront
         # allocation if max_model_len is big.
         # Maps req_index -> tensor of shape (num_prompt_tokens, hidden_size)
@@ -407,6 +408,7 @@ class InputBatch:
         self._dyn_action: DynAssistedActionState | None = None
 
     def initialize_token_top_ks(self, num_moe_layers: int, base_top_k: int):
+        self.token_top_ks_base_value = int(base_top_k)
         self.token_top_ks_cpu_tensor = torch.full(
             (self.max_num_reqs, self.max_model_len, num_moe_layers),
             base_top_k,
@@ -477,6 +479,54 @@ class InputBatch:
             raise ValueError("token_top_ks_cpu_tensor is not initialized.")
         return self.token_top_ks_cpu_tensor.numpy()
 
+    def _reset_token_top_ks(
+        self,
+        req_index: int,
+        start: int = 0,
+        end: int | None = None,
+    ) -> None:
+        if self.token_top_ks_cpu_tensor is None:
+            return
+        assert self.token_top_ks_base_value is not None
+        end = self.max_model_len if end is None else min(end, self.max_model_len)
+        start = max(start, 0)
+        if end <= start:
+            return
+        self.token_top_ks_cpu_tensor[req_index, start:end].fill_(
+            self.token_top_ks_base_value
+        )
+
+    def _copy_token_top_ks(
+        self,
+        dst_index: int,
+        src_index: int,
+        num_tokens: int,
+    ) -> None:
+        if self.token_top_ks_cpu_tensor is None or num_tokens <= 0:
+            return
+        self.token_top_ks_cpu_tensor[dst_index, :num_tokens] = (
+            self.token_top_ks_cpu_tensor[src_index, :num_tokens]
+        )
+
+    def set_token_top_ks(
+        self,
+        req_index: int,
+        start: int,
+        token_top_ks: Sequence[Sequence[int]] | torch.Tensor | np.ndarray | None,
+        num_tokens: int,
+    ) -> None:
+        if self.token_top_ks_cpu_tensor is None or num_tokens <= 0:
+            return
+        end = start + num_tokens
+        if token_top_ks is None:
+            self._reset_token_top_ks(req_index, start, end)
+            return
+        self.token_top_ks_cpu_tensor[req_index, start:end] = torch.as_tensor(
+            token_top_ks,
+            dtype=self.token_top_ks_cpu_tensor.dtype,
+            device="cpu",
+        )[:num_tokens]
+
     def _register_add_request(self, request: "CachedRequestState") -> int:
         """Track add-request operations for logits processors.
         Not applicable to pooling models.
@@ -544,6 +594,11 @@ class InputBatch:
         self.is_token_ids[req_index, start_idx:end_idx] = True
         # Number of tokens without spec decode tokens.
         self.num_tokens_no_spec[req_index] = request.num_tokens
+        # A reused request slot may contain dynamic top-k plans from an
+        # earlier request. New prompt/output positions always start at the
+        # model's base top-k and are overwritten only by scheduled Spec-K
+        # metadata.
+        self._reset_token_top_ks(req_index, 0, max(end_idx, 1))
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
         self.block_table.add_row(request.block_ids, req_index)
@@ -675,6 +730,11 @@ class InputBatch:
         num_spec_tokens = len(spec_token_ids)
         request.prev_num_draft_len = num_spec_tokens
         if not spec_token_ids:
+            # No draft plan is active for this step. Ensure the token that
+            # would otherwise be assisted by the first draft top-k runs at
+            # the base top-k instead of retaining a previous plan.
+            start_index = self.num_tokens_no_spec[req_index]
+            self._reset_token_top_ks(req_index, start_index - 1, start_index)
             return
 
         # For async scheduling, token_ids_cpu assigned from
@@ -686,7 +746,18 @@ class InputBatch:
         self.is_token_ids[req_index, start_index:end_token_index] = True
         # NOTE(seven-mile): token topks is 1+gamma, the first k assists
         # the last one of non-spec tokens.
-        self.token_top_ks_cpu[req_index, start_index-1:end_token_index] = spec_token_top_ks
+        if not spec_token_top_ks:
+            self._reset_token_top_ks(req_index, start_index - 1, end_token_index)
+        elif len(spec_token_top_ks) != num_spec_tokens + 1:
+            raise ValueError(
+                "scheduled_spec_token_top_ks must contain exactly "
+                f"num_spec_tokens + 1 entries, got {len(spec_token_top_ks)} "
+                f"for {num_spec_tokens} spec tokens."
+            )
+        else:
+            self.token_top_ks_cpu[req_index, start_index-1:end_token_index] = (
+                spec_token_top_ks
+            )
         cur_spec_token_ids.extend(spec_token_ids)
 
     def remove_request(self, req_id: str) -> int | None:
@@ -704,10 +775,15 @@ class InputBatch:
             return None
 
         self.batch_update_builder.removed_append(req_index)
+        active_token_count = self._get_active_token_count(req_index)
         self._req_ids[req_index] = None
         self.req_output_token_ids[req_index] = None
         self.spec_token_ids[req_index].clear()
         self.block_table.clear_row(req_index)
+        if req_index >= self.num_reqs:
+            # Rows beyond the post-removal active prefix cannot be reused by
+            # condense(), so clear their dynamic top-k state immediately.
+            self._reset_token_top_ks(req_index, 0, max(active_token_count, 1))
 
         if self._dyn_action is not None:
             dyn_action = self.dyn_action
@@ -823,6 +899,17 @@ class InputBatch:
         self.is_token_ids[[i1, i2], :max_active_token_count] = self.is_token_ids[
             [i2, i1], :max_active_token_count
         ]
+        if self.token_top_ks_cpu_tensor is not None and max_active_token_count > 0:
+            tmp_token_top_ks = (
+                self.token_top_ks_cpu_tensor[i1, :max_active_token_count]
+                .clone()
+            )
+            self.token_top_ks_cpu_tensor[i1, :max_active_token_count] = (
+                self.token_top_ks_cpu_tensor[i2, :max_active_token_count]
+            )
+            self.token_top_ks_cpu_tensor[i2, :max_active_token_count] = (
+                tmp_token_top_ks
+            )
 
         # Swap prompt embeddings if they exist
         embeds_i1 = self.req_prompt_embeds.get(i1)
@@ -954,6 +1041,8 @@ class InputBatch:
             self.is_token_ids[empty_index, :num_tokens] = self.is_token_ids[
                 last_req_index, :num_tokens
             ]
+            self._copy_token_top_ks(empty_index, last_req_index, num_tokens)
+            self._reset_token_top_ks(last_req_index, 0, max(num_tokens, 1))
             if last_req_index in self.req_prompt_embeds:
                 self.req_prompt_embeds[empty_index] = self.req_prompt_embeds.pop(
                     last_req_index
