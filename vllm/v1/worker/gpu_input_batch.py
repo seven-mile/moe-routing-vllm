@@ -439,13 +439,13 @@ class InputBatch:
                 (self.max_num_reqs, int(base_top_k)),
                 dtype=torch.float32,
                 device="cpu",
-                pin_memory=self.pin_memory,
+                pin_memory=PIN_MEMORY,
             ),
             layer_mask_cpu_tensor=torch.zeros(
                 (self.max_num_reqs, int(num_moe_layers)),
                 dtype=torch.bool,
                 device="cpu",
-                pin_memory=self.pin_memory,
+                pin_memory=PIN_MEMORY,
             ),
         )
 

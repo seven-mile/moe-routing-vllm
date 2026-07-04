@@ -1897,10 +1897,10 @@ class GPUModelRunner(
         else:
             # Upload the index tensors asynchronously so the scatter can be non-blocking.
             sampled_tokens_index_tensor = torch.tensor(
-                sample_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
+                sample_flattened_indices, dtype=torch.int64, pin_memory=PIN_MEMORY
             ).to(self.device, non_blocking=True)
             prev_common_req_indices_tensor = torch.tensor(
-                prev_indices, dtype=torch.int64, pin_memory=self.pin_memory
+                prev_indices, dtype=torch.int64, pin_memory=PIN_MEMORY
             ).to(self.device, non_blocking=True)
             self.input_ids.gpu.scatter_(
                 dim=0,
@@ -1936,7 +1936,7 @@ class GPUModelRunner(
         prev_draft_token_top_k_indices_tensor = torch.tensor(
             prev_draft_token_top_k_indices,
             dtype=torch.int64,
-            pin_memory=self.pin_memory,
+            pin_memory=PIN_MEMORY,
         ).to(self.device, non_blocking=True)
 
         # because input_ids dtype is torch.int32,
@@ -7304,7 +7304,7 @@ class GPUModelRunner(
             (self.max_num_reqs, self.num_spec_tokens + 1, num_moe_layers),
             device="cpu",
             dtype=torch.int32,
-            pin_memory=self.pin_memory,
+            pin_memory=PIN_MEMORY,
         )
 
     def _allocate_kv_cache_tensors(
