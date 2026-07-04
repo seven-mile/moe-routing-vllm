@@ -413,8 +413,12 @@ def _has_module(module_name: str) -> bool:
 
 
 def has_deep_ep() -> bool:
-    """Whether the optional `deep_ep` package is available."""
-    return _has_module("deep_ep")
+    """Whether the optional `deep_ep` package has the V1 Buffer API."""
+    if not _has_module("deep_ep"):
+        return False
+    import deep_ep  # type: ignore[import-not-found]
+
+    return hasattr(deep_ep, "Buffer")
 
 
 DEEPEP_V2_MIN_NCCL_VERSION_RAW = 23004  # 2.30.4
