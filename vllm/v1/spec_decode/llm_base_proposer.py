@@ -45,7 +45,6 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     sample_with_exponential_noise,
 )
 from vllm.v1.sample.sampler import _SAMPLING_EPS
-from vllm.v1.spec_decode.fused_kernel import fused_logits_to_total_topk
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
@@ -793,12 +792,19 @@ class SpecDecodeBaseProposer:
         model_config = self.vllm_config.model_config
         batch_size, _ = token_ids.shape
 
-        base_top_k = model_config.get_num_experts_per_token()
         assert self.runner is not None
         target_model = self.runner.get_model()
-        assert is_mixture_of_experts(target_model), (
-            "The model must be a mixture of experts model."
-        )
+        if not is_mixture_of_experts(target_model):
+            # Dynamic expert routing is irrelevant for dense targets, but the
+            # shared speculative-decoding path still requires a shape-stable
+            # plan to copy alongside draft token IDs.
+            return torch.zeros(
+                (batch_size, logits.shape[1] + 1, 1),
+                dtype=torch.int32,
+                device=logits.device,
+            )
+
+        base_top_k = model_config.get_num_experts_per_token()
         assert target_model.num_moe_layers > 0, "No MoE layers found in the model."
 
         assert token_ids.device.type == self.device.type, (
@@ -827,15 +833,23 @@ class SpecDecodeBaseProposer:
         assert cfg_boundaries.shape[0] == batch_size
         assert layer_mask.shape[0] == batch_size
 
-        total_topks = fused_logits_to_total_topk(
+        return self._compute_total_top_ks(logits, action_tensors, base_top_k)
+
+    def _compute_total_top_ks(
+        self,
+        logits: torch.Tensor,
+        action_tensors: FusedTopKActionTensors,
+        base_top_k: int,
+    ) -> torch.Tensor:
+        from vllm.v1.spec_decode.fused_kernel import fused_logits_to_total_topk
+
+        return fused_logits_to_total_topk(
             logits=logits,
-            cfg_boundaries=cfg_boundaries,
-            layer_mask=layer_mask,
+            cfg_boundaries=action_tensors.cfg_boundaries,
+            layer_mask=action_tensors.layer_mask,
             base_k=base_top_k,
             apply_last_token=envs.VLLM_DYN_TOPK_APPLY_LAST_TOKEN,
-        )
-
-        return total_topks.contiguous()
+        ).contiguous()
 
     def _update_positions_dependent_metadata(
         self,

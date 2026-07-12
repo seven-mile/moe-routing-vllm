@@ -2949,8 +2949,8 @@ class GPUModelRunner(
             target_logits_indices=target_logits_indices,
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
-            num_moe_layers=self.model.num_moe_layers,
-            base_top_k=self.model_config.get_num_experts_per_token(),
+            num_moe_layers=max(int(getattr(self.model, "num_moe_layers", 0) or 0), 1),
+            base_top_k=self.model_config.get_num_experts_per_token() or 0,
         )
 
     def _prepare_kv_sharing_fast_prefill(
@@ -3638,12 +3638,11 @@ class GPUModelRunner(
                 )
 
             input_ids, inputs_embeds = self._prepare_mm_inputs(num_input_tokens)
-            input_top_ks = None
+            input_top_ks = self.input_top_ks.gpu[:num_input_tokens]
             model_kwargs = {
                 **self._init_model_kwargs(),
                 **self._extract_mm_kwargs(scheduler_output),
             }
-            raise NotImplementedError("token_top_ks NYI")
         elif self.enable_prompt_embeds and is_first_rank:
             # Get the input embeddings for the tokens that are not input embeds,
             # then put them into the appropriate positions.
@@ -3669,8 +3668,7 @@ class GPUModelRunner(
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
             model_kwargs = self._init_model_kwargs()
             input_ids = None
-            input_top_ks = None
-            assert False, "token_top_ks NYI"
+            input_top_ks = self.input_top_ks.gpu[:num_input_tokens]
         else:
             # For text-only models, we use token ids as input.
             # While it is possible to use embeddings as input just like the
@@ -5856,12 +5854,14 @@ class GPUModelRunner(
 
             @functools.cache
             def rand_input_top_ks() -> torch.Tensor:
-                base_top_k = self.model_config.get_num_experts_per_token()
+                base_top_k = self.model_config.get_num_experts_per_token() or 0
+                if base_top_k <= 1:
+                    return torch.full_like(self.input_top_ks.gpu, base_top_k)
                 return torch.randint_like(
-                    self.input_ids.gpu,
+                    self.input_top_ks.gpu,
                     low=1,
-                    high=base_top_k, # intentionally exclusive
-                    dtype=input_ids.dtype)
+                    high=base_top_k,  # intentionally exclusive
+                )
 
             logger.debug_once("Randomizing dummy input_ids for DP Rank")
             input_ids.copy_(rand_input_ids()[: input_ids.size(0)], non_blocking=True)
@@ -5873,7 +5873,7 @@ class GPUModelRunner(
             yield
             input_ids.fill_(0)
             if input_top_ks is not None:
-                base_top_k = self.model_config.get_num_experts_per_token()
+                base_top_k = self.model_config.get_num_experts_per_token() or 0
                 input_top_ks.fill_(base_top_k)
         else:
 
@@ -7291,11 +7291,15 @@ class GPUModelRunner(
         if not is_mixture_of_experts(self.model):
             warnings.warn(
                 "Reinitializing token_top_ks buffer for a non-MoE model.")
-            return
-        num_moe_layers = self.model.num_moe_layers
-        base_top_k = self.model_config.get_num_experts_per_token()
+            # Keep the shared input path valid for non-MoE models.  The
+            # single zero column is ignored because no MoE layer consumes it.
+            num_moe_layers = 1
+            base_top_k = 0
+        else:
+            num_moe_layers = self.model.num_moe_layers
+            base_top_k = self.model_config.get_num_experts_per_token()
         self.input_batch.initialize_token_top_ks(num_moe_layers, base_top_k)
-        
+
         self._input_top_ks = self._make_buffer(self.max_num_tokens,
                                                num_moe_layers,
                                                dtype=torch.int32)

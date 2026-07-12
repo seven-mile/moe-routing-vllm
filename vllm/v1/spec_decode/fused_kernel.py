@@ -131,6 +131,10 @@ def _as_cuda_contiguous(t: torch.Tensor, name: str) -> torch.Tensor:
     return t.contiguous()
 
 
+class _TritonKernelUnsupported(RuntimeError):
+    pass
+
+
 def _next_pow2(n: int) -> int:
     n = max(1, int(n))
     p = 1
@@ -310,7 +314,67 @@ def fused_logits_to_total_topk_kernel(
     )
 
 
-def fused_logits_to_total_topk(
+def torch_logits_to_total_topk(
+    logits: torch.Tensor,
+    cfg_boundaries: torch.Tensor,
+    layer_mask: torch.Tensor,
+    base_k: int,
+    *,
+    apply_last_token: bool,
+) -> torch.Tensor:
+    """Device-independent reference implementation for total top-k."""
+    logits_f = logits.to(dtype=torch.float32)
+    cfg_boundaries = cfg_boundaries.to(dtype=torch.float32)
+    layer_mask = layer_mask.to(dtype=torch.bool)
+    if logits_f.ndim != 3:
+        raise ValueError(f"logits must be [B,S,V], got {tuple(logits.shape)}")
+    if cfg_boundaries.ndim != 2:
+        raise ValueError(
+            f"cfg_boundaries must be [B,K], got {tuple(cfg_boundaries.shape)}"
+        )
+    if layer_mask.ndim != 2:
+        raise ValueError(f"layer_mask must be [B,L], got {tuple(layer_mask.shape)}")
+
+    batch_size, seq_len, _ = logits_f.shape
+    if cfg_boundaries.shape[0] != batch_size or layer_mask.shape[0] != batch_size:
+        raise ValueError(
+            "Batch mismatch: "
+            f"logits={batch_size}, cfg_boundaries={cfg_boundaries.shape[0]}, "
+            f"layer_mask={layer_mask.shape[0]}"
+        )
+
+    log_z = torch.logsumexp(logits_f, dim=-1)
+    probs = torch.softmax(logits_f, dim=-1)
+    entropy = log_z - (probs * logits_f).sum(dim=-1)
+    ppls = entropy.exp()
+    k_basic = (ppls.unsqueeze(-1) >= cfg_boundaries.unsqueeze(1)).sum(dim=-1)
+    k_values = torch.where(
+        layer_mask[:, None, :],
+        torch.as_tensor(base_k, dtype=torch.int32, device=logits.device),
+        k_basic.to(dtype=torch.int32)[:, :, None],
+    )
+
+    if apply_last_token:
+        mean_k_basic = (
+            k_basic.sum(dim=1).to(dtype=torch.float32) / max(seq_len, 1)
+        ).to(dtype=torch.int32)
+        last_values = torch.where(
+            layer_mask,
+            torch.as_tensor(base_k, dtype=torch.int32, device=logits.device),
+            mean_k_basic[:, None],
+        )
+    else:
+        last_values = torch.full(
+            (batch_size, layer_mask.shape[1]),
+            base_k,
+            dtype=torch.int32,
+            device=logits.device,
+        )
+
+    return torch.cat((k_values, last_values[:, None, :]), dim=1).contiguous()
+
+
+def _fused_logits_to_total_topk(
     logits: torch.Tensor,
     cfg_boundaries: torch.Tensor,
     layer_mask: torch.Tensor,
@@ -344,6 +408,8 @@ def fused_logits_to_total_topk(
     Returns:
         Tensor of shape ``[B,S+1,L]`` with dtype ``torch.int32``.
     """
+    if not logits.is_cuda:
+        raise _TritonKernelUnsupported
     logits = _as_cuda_contiguous(logits, "logits")
     cfg_boundaries = _as_cuda_contiguous(
         cfg_boundaries.to(dtype=torch.float32), "cfg_boundaries"
@@ -412,3 +478,36 @@ def fused_logits_to_total_topk(
         APPLY_LAST_TOKEN=apply_last_token,
     )
     return total_topks.contiguous()
+
+
+def fused_logits_to_total_topk(
+    logits: torch.Tensor,
+    cfg_boundaries: torch.Tensor,
+    layer_mask: torch.Tensor,
+    base_k: int,
+    *,
+    apply_last_token: bool,
+    pad_s: int | None = None,
+    block_v: int = 128,
+    block_l: int = 8,
+) -> torch.Tensor:
+    """Best-effort total top-k: Triton acceleration with a Torch fallback."""
+    try:
+        return _fused_logits_to_total_topk(
+            logits,
+            cfg_boundaries,
+            layer_mask,
+            base_k,
+            apply_last_token=apply_last_token,
+            pad_s=pad_s,
+            block_v=block_v,
+            block_l=block_l,
+        )
+    except _TritonKernelUnsupported:
+        return torch_logits_to_total_topk(
+            logits,
+            cfg_boundaries,
+            layer_mask,
+            base_k,
+            apply_last_token=apply_last_token,
+        )

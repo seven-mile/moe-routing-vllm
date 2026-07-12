@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
 import torch
 
 from vllm.platforms import current_platform
@@ -8,6 +11,7 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.llm_base_proposer import (
+    SpecDecodeBaseProposer,
     compute_probs_and_sample_next_token,
 )
 
@@ -68,3 +72,23 @@ def test_compute_probs_and_sample_next_token_uses_fp64_exponential_race():
 
     assert torch.equal(actual_ids, expected_ids)
     assert torch.allclose(actual_probs, probs)
+
+
+def test_dense_target_uses_zero_topk_plan_without_loading_fused_kernel():
+    proposer = SpecDecodeBaseProposer.__new__(SpecDecodeBaseProposer)
+    proposer.vllm_config = SimpleNamespace(model_config=MagicMock())
+    proposer.runner = MagicMock()
+    proposer.runner.get_model.return_value = object()
+
+    token_ids = torch.zeros((2, 3), dtype=torch.int64)
+    logits = torch.zeros((2, 3, 8))
+    with patch(
+        "vllm.v1.spec_decode.llm_base_proposer.is_mixture_of_experts",
+        return_value=False,
+    ):
+        token_top_ks = proposer.get_token_top_ks_from_proposals(token_ids, logits)
+
+    assert token_top_ks.shape == (2, 4, 1)
+    assert token_top_ks.dtype == torch.int32
+    assert torch.count_nonzero(token_top_ks) == 0
+    proposer.vllm_config.model_config.get_num_experts_per_token.assert_not_called()

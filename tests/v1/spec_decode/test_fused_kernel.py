@@ -13,8 +13,41 @@ from vllm.platforms import current_platform
 from vllm.v1.spec_decode.fused_kernel import (
     LAYER_RANGE_INACTIVE,
     fused_logits_to_topk,
+    fused_logits_to_total_topk,
+    torch_logits_to_total_topk,
 )
 from vllm.v1.spec_decode.utils import calc_distribution_perplexity
+
+
+@pytest.mark.skip_global_cleanup
+def test_total_topk_uses_device_independent_fallback_on_cpu() -> None:
+    torch.manual_seed(0)
+    logits = torch.randn(2, 3, 17)
+    cfg_boundaries = torch.tensor(
+        [[0.0, 0.0, 2.0, 4.0], [0.0, 1.0, 3.0, 5.0]],
+        dtype=torch.float32,
+    )
+    layer_mask = torch.tensor(
+        [[True, False, False], [False, True, False]],
+        dtype=torch.bool,
+    )
+
+    expected = torch_logits_to_total_topk(
+        logits,
+        cfg_boundaries,
+        layer_mask,
+        4,
+        apply_last_token=True,
+    )
+    actual = fused_logits_to_total_topk(
+        logits,
+        cfg_boundaries,
+        layer_mask,
+        4,
+        apply_last_token=True,
+    )
+
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA not available")

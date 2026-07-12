@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import inspect
 from collections.abc import Sequence
 
 import numpy as np
@@ -49,6 +48,7 @@ def _udf_config(function: str, args=None, kwargs=None) -> str:
     ).dumps()
 
 
+@pytest.mark.skip_global_cleanup
 def test_dyn_assisted_action_config_parsing():
     assert DynAssistedActionState._extract_vectorized_action_params("null") == (
         False,
@@ -72,6 +72,7 @@ def test_dyn_assisted_action_config_parsing():
         )
 
 
+@pytest.mark.skip_global_cleanup
 def test_dyn_assisted_action_state_tracks_batch_vectorization():
     state = DynAssistedActionState(
         cfg_boundaries=torch.zeros((3, 4), dtype=torch.float32),
@@ -107,11 +108,18 @@ def test_dyn_assisted_action_state_tracks_batch_vectorization():
     ]
 
 
-def _compare_objs(obj1, obj2, skip: Sequence = ("logitsprocs", "batch_update_builder")):
-    attrs = inspect.getmembers(obj1, lambda a: not (inspect.isroutine(a)))
-    attr_names = set(
-        [a[0] for a in attrs if not (a[0].startswith("__") and a[0].endswith("__"))]
-    )
+def _compare_objs(
+    obj1,
+    obj2,
+    skip: Sequence = ("logitsprocs", "batch_update_builder", "dyn_action"),
+):
+    # Avoid evaluating assertion-backed properties before they can be skipped.
+    # The underlying _dyn_action state is still compared below.
+    attr_names = {
+        attr_name
+        for attr_name in dir(obj1)
+        if not (attr_name.startswith("__") and attr_name.endswith("__"))
+    }
     for attr_name in attr_names:
         if attr_name in skip:
             continue
@@ -323,7 +331,6 @@ def _make_input_batch_with_topks(max_num_reqs: int = 4) -> InputBatch:
         max_model_len=16,
         max_num_batched_tokens=16,
         device=torch.device("cpu"),
-        pin_memory=False,
         vocab_size=VOCAB_SIZE,
         block_sizes=[1],
         kernel_block_sizes=[1],
@@ -332,6 +339,7 @@ def _make_input_batch_with_topks(max_num_reqs: int = 4) -> InputBatch:
     return input_batch
 
 
+@pytest.mark.skip_global_cleanup
 def test_token_top_ks_reset_when_request_slot_reused():
     input_batch = _make_input_batch_with_topks(max_num_reqs=1)
     dynamic_req = _make_cached_request(
@@ -370,6 +378,7 @@ def test_token_top_ks_reset_when_request_slot_reused():
     assert not input_batch.dyn_action.has_vectorized_action_cpu_tensor[0]
 
 
+@pytest.mark.skip_global_cleanup
 def test_token_top_ks_move_with_swap_and_condense():
     input_batch = _make_input_batch_with_topks(max_num_reqs=3)
     req0 = _make_cached_request("req0", [1, 2])

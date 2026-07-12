@@ -55,13 +55,21 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         base = super()._create_draft_vllm_config()
         spec = self.speculative_config
 
+        # Draft workers run with a single DP group, but each target DP rank
+        # still needs an isolated compile artifact.  Otherwise all workers
+        # reuse rank_0_0 and an AOT graph can retain another worker's NPU.
+        draft_parallel_config = replace(
+            spec.draft_parallel_config,
+            rank=self.vllm_config.parallel_config.rank,
+        )
+        draft_parallel_config.data_parallel_index = (
+            self.vllm_config.parallel_config.data_parallel_index
+        )
+
         return replace(
             base,
             quant_config=None,
-            parallel_config=replace(
-                spec.draft_parallel_config,
-                rank=self.vllm_config.parallel_config.rank,
-            ),
+            parallel_config=draft_parallel_config,
             model_config=spec.draft_model_config,
         )
 
